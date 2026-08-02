@@ -1,7 +1,7 @@
 from pathlib import Path
 
 # --- Version & Metadata ---
-__version__ = "0.1"
+__version__ = "0.2"
 __author__ = "np4abdou1"
 __license__ = "GPL-3.0"
 

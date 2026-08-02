@@ -22,7 +22,7 @@ if HAS_FASTAPI:
     app = FastAPI(
         title="Cenima CLI API",
         description="REST API for TopCinema browsing and streaming",
-        version="1.0.0"
+        version="0.2.0"
     )
 
     app.add_middleware(
