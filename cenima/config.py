@@ -10,7 +10,7 @@ CONFIG_DIR = Path.home() / ".config" / "cenima-cli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # --- Scraper Configuration ---
-BASE_URL = "https://topcinema.media"
+BASE_URL = "https://topcinemaa.cc"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",

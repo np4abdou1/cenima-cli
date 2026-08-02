@@ -1,130 +1,39 @@
-from fastapi import FastAPI, HTTPException, Query, Path
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
 from urllib.parse import urljoin
 import re
 
-# Import existing scraper and our new processor
-from .scraper import TopCinemaScraper, clean_arabic_title
+# Import existing scraper and processor
+from .scraper import TopCinemaScraper, clean_arabic_title, clean_show_title
 from .processor import VidTubeProcessor
 
-class SearchResult(BaseModel):
-    title: str
-    original_title: Optional[str] = None
-    url: str
-    type: str
-    year: Optional[int] = None
-    rating: Optional[float] = None
-    poster: Optional[str] = None
-    quality: Optional[str] = None
+scraper = TopCinemaScraper()
 
-class Episode(BaseModel):
-    episode_number: str
-    display_number: str
-    title: str
-    url: str
-    is_special: bool = False
-    servers: List[dict] = []
+try:
+    from fastapi import FastAPI, HTTPException, Query, Path
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.concurrency import run_in_threadpool
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
+    FastAPI = None
 
-class Season(BaseModel):
-    season_number: int
-    display_label: str
-    poster: Optional[str] = None
-    episodes: List[Episode] = []
+if HAS_FASTAPI:
+    app = FastAPI(
+        title="Cenima CLI API",
+        description="REST API for TopCinema browsing and streaming",
+        version="1.0.0"
+    )
 
-class ShowDetails(BaseModel):
-    title: str
-    original_title: Optional[str] = None
-    url: str
-    type: str
-    bg_poster: Optional[str] = None # poster
-    description: Optional[str] = None # synopsis
-    rating: Optional[float] = None # imdb_rating
-    year: Optional[int] = None
-    genres: List[str] = []
-    trailer: Optional[str] = None
-    seasons: List[Season] = []
-    servers: List[dict] = [] # For movies
-
-class StreamSource(BaseModel):
-    server_number: int
-    embed_url: str
-    video_url: str
-    headers: dict = {}
-    mpv_command: str
-
-class APITopCinemaScraper(TopCinemaScraper):
-    def __init__(self):
-        super().__init__()
-        self.vidtube_processor = VidTubeProcessor(self.session)
-        
-    def _extract_vidtube_url(self, embed_url: str) -> Optional[str]:
-        return self.vidtube_processor.extract(embed_url)
-
-    def _parse_metadata(self, soup: Any, url: str) -> Dict:
-        meta = super()._parse_metadata(soup, url)
-        
-        # If title is generic site name, try harder
-        if meta.get("title", "").strip().lower() == "topcinema":
-            # Try to find a better title from breadcrumbs or other headers
-            # Often .Title or .title class
-            candidates = soup.select("h2.title, h3.title, .Title, .product-title")
-            for c in candidates:
-                text = clean_show_title(c.get_text())
-                if text and text.lower() != "topcinema":
-                    meta["title"] = text
-                    break
-        
-        if meta.get("title"):
-             meta["title"] = clean_show_title(meta["title"])
-             
-        return meta
-
-    def _parse_search_result(self, item) -> Optional[Dict]:
-        res = super()._parse_search_result(item)
-        if not res: return None
-        
-        url = res.get("url", "")
-        title = res.get("title", "")
-        
-        # English URLs often have /series/anime-... which triggers series first in original logic
-        # We enforce anime check if 'anime' is in URL or title
-        if "anime" in url.lower() or "انمي" in title or "anime" in title.lower():
-            res["type"] = "anime"
-            
-        return res
-
-    def _parse_episode_link(self, link_elem, url: str) -> Optional[Dict]:
-        if url and not url.startswith(('http:', 'https:')):
-            url = urljoin(self.base_url, url)
-        
-        # Filter out obviously bad links that might be caught
-        if '/category/' in url or '/genre/' in url:
-            return None
-            
-        data = super()._parse_episode_link(link_elem, url)
-        if data and data.get("title"):
-             data["title"] = clean_show_title(data["title"])
-             
-        return data
-
-scraper = APITopCinemaScraper()
-
-app = FastAPI(
-    title="Cenima CLI API",
-    description="REST API for TopCinema browsing and streaming",
-    version="1.0.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app = None
 
 def clean_show_title(title: str) -> str:
     cleaned = clean_arabic_title(title)

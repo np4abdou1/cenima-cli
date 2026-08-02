@@ -5,12 +5,15 @@ from bs4 import BeautifulSoup
 from curl_cffi import requests
 
 class VidTubeProcessor:
-    def __init__(self, session=None):
+    def __init__(self, session=None, referer=None):
         self.session = session or requests.Session(impersonate="chrome120")
         self.headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         }
+        if referer:
+            self.headers["Referer"] = referer
+            self.headers["Origin"] = referer.rstrip('/')
 
     def _unpack(self, p, a, c, k):
         def to_base(n, b):
@@ -58,7 +61,7 @@ class VidTubeProcessor:
             
         return None
 
-    def _handle_vidtube_pro(self, target_url, html):
+    def _handle_vidtube_pro(self, target_url, html, req_headers):
         soup = BeautifulSoup(html, "html.parser")
         
         priorities = [
@@ -99,7 +102,7 @@ class VidTubeProcessor:
         next_url = urljoin(target_url, next_path)
         
         try:
-            resp = self.session.get(next_url, headers=self.headers)
+            resp = self.session.get(next_url, headers=req_headers)
             if resp.status_code != 200:
                 return None
             html2 = resp.text
@@ -119,9 +122,16 @@ class VidTubeProcessor:
             
         return None
 
-    def extract(self, url):
+    def extract(self, url, referer=None):
         try:
-            resp = self.session.get(url, headers=self.headers)
+            headers = self.headers.copy()
+            if referer:
+                headers["Referer"] = referer
+                headers["Origin"] = referer.rstrip('/')
+            elif "Referer" not in headers:
+                headers["Referer"] = "https://topcinemaa.cc/"
+
+            resp = self.session.get(url, headers=headers)
             if resp.status_code != 200:
                 return None
                 
@@ -131,7 +141,7 @@ class VidTubeProcessor:
             if 'vidtube.one' in parsed.hostname:
                 return self._handle_vidtube_one(html)
             else:
-                return self._handle_vidtube_pro(url, html)
+                return self._handle_vidtube_pro(url, html, headers)
                 
         except Exception as e:
             return None

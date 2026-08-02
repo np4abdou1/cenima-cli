@@ -40,6 +40,29 @@ def clean_arabic_title(text: str) -> str:
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
+def clean_show_title(title: str) -> str:
+    cleaned = clean_arabic_title(title)
+    
+    if cleaned.lower() == 'topcinema':
+        return ""
+
+    junk_patterns = [
+        r'\b(?:1080p|720p|480p|360p)\b',
+        r'\b(?:WEB-DL|BluRay|HDTV|CAM)\b',
+        r'\b(?:x264|x265|HEVC)\b',
+        r'\b(?:\d{1,2}\.\d)\b',
+        r'[★⭐]\s*\d+\.?\d*',
+        r'\[\s*\d+\.?\d*\s*\]',
+        r'\b(?:Season|الموسم)\s*\d+',
+        r'\b(?:Episode|الحلقة)\s*\d+',
+    ]
+    
+    for pattern in junk_patterns:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+    
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
 def parse_episode_number(ep_str: str) -> float:
     if not ep_str:
         return 99999.0
@@ -131,14 +154,15 @@ def extract_season_part(text: str) -> Optional[str]:
 class TopCinemaScraper:
     
     def __init__(self, base_url: Optional[str] = None):
+        from .processor import VidTubeProcessor
         self.session = requests.Session(impersonate="chrome120")
         
-        if base_url:
-            self.base_url = base_url.rstrip('/')
-        else:
-            self.base_url = "https://topcinema.media"
+        self.base_url = (base_url or BASE_URL).rstrip('/')
         
-        self.session.headers.update(HEADERS)
+        headers = HEADERS.copy()
+        headers["Referer"] = self.base_url
+        self.session.headers.update(headers)
+        self.vidtube_processor = VidTubeProcessor(self.session, referer=self.base_url)
     
     def _discover_domain(self) -> str:
         try:
@@ -201,10 +225,10 @@ class TopCinemaScraper:
             title = clean_text(title_elem.get_text()) if title_elem else clean_text(link.get("title", "Unknown"))
             
             show_type = "movie"
-            if "مسلسل" in url or "/series/" in url or "مسلسل" in title:
-                show_type = "series"
-            elif "انمي" in url or "/anime/" in url or "انمي" in title:
+            if "anime" in url.lower() or "انمي" in title or "anime" in title.lower():
                 show_type = "anime"
+            elif "مسلسل" in url or "/series/" in url or "مسلسل" in title:
+                show_type = "series"
             elif "فيلم" in url or "/movie/" in url or "فيلم" in title:
                 show_type = "movie"
             
@@ -732,18 +756,14 @@ class TopCinemaScraper:
     
     # --- Servers ---
     
-    def _extract_vidtube_url(self, embed_url: str) -> Optional[str]:
+    def _extract_vidtube_url(self, embed_url: str, referer: Optional[str] = None) -> Optional[str]:
         """Extract actual video URL from embed page using Python VidTubeProcessor."""
-        from .processor import VidTubeProcessor
-        
-        # Check if it's actually a vidtube domain
         vidtube_domains = ['vidtube.one', 'vidtube.pro', 'vidtube.me', 'vidtube.to']
         if not any(domain in embed_url.lower() for domain in vidtube_domains):
             return None
             
         try:
-             processor = VidTubeProcessor(self.session)
-             return processor.extract(embed_url)
+             return self.vidtube_processor.extract(embed_url, referer=referer or self.base_url)
         except Exception as e:
             return None
 
@@ -772,8 +792,7 @@ class TopCinemaScraper:
                         embed_url = iframe["src"].strip()
                         
                         if 'vidtube' in embed_url.lower():
-                            # Extract actual video URL using script.mjs logic (internal method)
-                            video_url = self._extract_vidtube_url(embed_url)
+                            video_url = self._extract_vidtube_url(embed_url, referer=referer)
                             
                             if video_url:
                                 servers.append({

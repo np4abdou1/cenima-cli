@@ -22,7 +22,9 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.style import Style
 
-from .api import scraper, clean_show_title
+from .scraper import TopCinemaScraper, clean_show_title
+
+scraper = TopCinemaScraper()
 from .config import (
     __version__, __author__, __license__,
     CONFIG_DIR, CONFIG_FILE,
