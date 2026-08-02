@@ -1,4 +1,9 @@
-Topcenima domain keeps changing so just change it in the config and this would work. 
+<div align="center">
 
+# CENIMA-CLI ( by np4abdou1 ) - ALPHA
 
-i will eventually fix this in the future
+### REVIVAL [in progress...]
+
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/b77ee381-f667-481d-9d2d-97cb760bb02b" />
+
+</div>
