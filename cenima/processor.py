@@ -61,6 +61,17 @@ class VidTubeProcessor:
             
         return None
 
+    def _extract_file_code(self, url: str) -> Optional[str]:
+        try:
+            parsed = urlparse(url)
+            path = parsed.path
+            match = re.search(r"/(?:embed-|d/|v/)?([a-zA-Z0-9]{8,32})(?:_[a-z0-9]+)?(?:\.html)?", path)
+            if match:
+                return match.group(1)
+            return None
+        except Exception:
+            return None
+
     def _handle_vidtube_pro(self, target_url, html, req_headers):
         soup = BeautifulSoup(html, "html.parser")
         
@@ -106,12 +117,15 @@ class VidTubeProcessor:
             if resp.status_code != 200:
                 return None
             html2 = resp.text
-        except Exception as e:
+        except Exception:
             return None
         
         soup2 = BeautifulSoup(html2, "html.parser")
         
-        btn = soup2.select_one('a.btn.btn-gradient.submit-btn')
+        btn = (soup2.select_one('a.btn.btn-gradient.submit-btn') or 
+               soup2.select_one('a.submit-btn') or 
+               soup2.select_one('a.btn-gradient') or
+               soup2.select_one('a[href*=".mp4"]'))
         if btn and btn.get('href'):
             return btn['href']
         
@@ -131,17 +145,43 @@ class VidTubeProcessor:
             elif "Referer" not in headers:
                 headers["Referer"] = "https://topcinemaa.cc/"
 
-            resp = self.session.get(url, headers=headers)
+            parsed = urlparse(url)
+            file_code = self._extract_file_code(url)
+
+            # Strategy 1: Direct MP4 resolution via VidTube download portal pages (/d/<code>.html)
+            # This yields unthrottled direct .mp4 links instead of unstable .m3u8 playlists.
+            if file_code:
+                download_urls = []
+                download_urls.append(f"https://down.vidtube.one/d/{file_code}.html")
+                if parsed.hostname and parsed.hostname != "down.vidtube.one":
+                    download_urls.append(f"https://{parsed.hostname}/d/{file_code}.html")
+                    download_urls.append(f"https://{parsed.hostname}/d/{file_code}")
+
+                for dl_url in download_urls:
+                    try:
+                        dl_resp = self.session.get(dl_url, headers=headers, timeout=10)
+                        if dl_resp.status_code == 200:
+                            direct_url = self._handle_vidtube_pro(dl_url, dl_resp.text, headers)
+                            if direct_url:
+                                return direct_url
+                    except Exception:
+                        continue
+
+            # Strategy 2: Fallback to querying original URL directly
+            resp = self.session.get(url, headers=headers, timeout=10)
             if resp.status_code != 200:
                 return None
                 
             html = resp.text
-            parsed = urlparse(url)
             
-            if 'vidtube.one' in parsed.hostname:
-                return self._handle_vidtube_one(html)
-            else:
-                return self._handle_vidtube_pro(url, html, headers)
+            # Try VidTube pro download link extraction on target page HTML
+            pro_url = self._handle_vidtube_pro(url, html, headers)
+            if pro_url:
+                return pro_url
+
+            # Strategy 3: Final fallback to packed JS inline player decoder (_handle_vidtube_one)
+            return self._handle_vidtube_one(html)
                 
-        except Exception as e:
+        except Exception:
             return None
+

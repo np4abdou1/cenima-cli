@@ -2,13 +2,15 @@
 import re
 import json
 import os
+import time
 from curl_cffi import requests
 from typing import List, Dict, Optional, Any
 from urllib.parse import quote, urlparse, unquote
 from bs4 import BeautifulSoup
 
 from .config import (
-    BASE_URL, HEADERS, AJAX_HEADERS,
+    BASE_URL, MIRROR_DOMAINS, DOMAIN_CACHE_FILE, CONFIG_DIR,
+    HEADERS, AJAX_HEADERS,
     REQUEST_TIMEOUT, RETRY_TOTAL, RETRY_BACKOFF, RETRY_STATUS_CODES
 )
 
@@ -153,7 +155,7 @@ def extract_season_part(text: str) -> Optional[str]:
 
 class TopCinemaScraper:
     
-    def __init__(self, base_url: Optional[str] = None):
+    def __init__(self, base_url: Optional[str] = None, auto_discover: bool = True):
         from .processor import VidTubeProcessor
         self.session = requests.Session(impersonate="chrome120")
         
@@ -163,14 +165,57 @@ class TopCinemaScraper:
         headers["Referer"] = self.base_url
         self.session.headers.update(headers)
         self.vidtube_processor = VidTubeProcessor(self.session, referer=self.base_url)
+        
+        if auto_discover:
+            self._discover_domain()
     
-    def _discover_domain(self) -> str:
-        try:
-            response = self.session.get(BASE_URL, timeout=10)
-            final_url = response.url.rstrip('/')
-            return final_url
-        except Exception:
-            return BASE_URL.rstrip('/')
+    def _set_active_domain(self, domain: str):
+        self.base_url = domain.rstrip('/')
+        self.session.headers["Referer"] = self.base_url
+        if hasattr(self, 'vidtube_processor') and self.vidtube_processor:
+            self.vidtube_processor.headers["Referer"] = self.base_url
+            self.vidtube_processor.headers["Origin"] = self.base_url
+
+    def _discover_domain(self, force: bool = False) -> str:
+        """Find active working domain by probing mirrors and following 301/302 redirects."""
+        if not force and DOMAIN_CACHE_FILE.exists():
+            try:
+                cache_data = json.loads(DOMAIN_CACHE_FILE.read_text())
+                cached_url = cache_data.get("domain")
+                if cached_url and time.time() - cache_data.get("timestamp", 0) < 86400:
+                    self._set_active_domain(cached_url)
+                    return self.base_url
+            except Exception:
+                pass
+
+        candidates = []
+        if self.base_url:
+            candidates.append(self.base_url)
+        candidates.append(BASE_URL)
+        candidates.extend([d for d in MIRROR_DOMAINS if d not in candidates])
+
+        for cand in candidates:
+            try:
+                response = self.session.get(cand, timeout=6, allow_redirects=True)
+                if response.status_code == 200:
+                    parsed = urlparse(response.url)
+                    resolved = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
+                    self._set_active_domain(resolved)
+                    
+                    try:
+                        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                        DOMAIN_CACHE_FILE.write_text(json.dumps({
+                            "domain": resolved,
+                            "timestamp": time.time()
+                        }))
+                    except Exception:
+                        pass
+                        
+                    return resolved
+            except Exception:
+                continue
+
+        return self.base_url
     
     def _get_endpoint(self, endpoint_type: str) -> str:
         base = self.base_url.rstrip('/')
@@ -182,8 +227,12 @@ class TopCinemaScraper:
         return endpoints.get(endpoint_type, "")
     
     def search(self, query: str, content_type: Optional[str] = None) -> List[Dict]:
+        results = []
+        seen_urls = set()
+
+        # Method 1: AJAX Searching.php endpoint
         try:
-            data = {"search": query, "type": "all"}
+            data = {"query": query, "search": query, "type": content_type or "all"}
             ajax_headers = AJAX_HEADERS.copy()
             ajax_headers["Referer"] = self.base_url
             ajax_headers["Origin"] = self.base_url
@@ -193,25 +242,46 @@ class TopCinemaScraper:
                 data=data,
                 headers=ajax_headers,
                 timeout=REQUEST_TIMEOUT,
-                allow_redirects=False
+                allow_redirects=True
             )
-            response.raise_for_status()
             
-            soup = BeautifulSoup(response.text, "html.parser")
-            results = []
-            
-            for item in soup.select(".Small--Box"):
-                result = self._parse_search_result(item)
-                if result:
-                    if content_type and result.get("type") != content_type:
-                        continue
-                    results.append(result)
-            
-            return results
-        
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, "html.parser")
+                for item in soup.select(".Small--Box"):
+                    result = self._parse_search_result(item)
+                    if result and result["url"] not in seen_urls:
+                        if content_type and result.get("type") != content_type:
+                            continue
+                        seen_urls.add(result["url"])
+                        results.append(result)
         except Exception as e:
-            print(f"[ERROR] Search failed: {e}")
-            return []
+            pass
+
+        # Method 2: Fallback GET search page if AJAX returns no results
+        if not results:
+            try:
+                get_url = f"{self.base_url}/search/?query={quote(query)}"
+                if content_type:
+                    get_url += f"&type={content_type}"
+                
+                response = self.session.get(
+                    get_url,
+                    timeout=REQUEST_TIMEOUT,
+                    allow_redirects=True
+                )
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, "html.parser")
+                    for item in soup.select(".Small--Box"):
+                        result = self._parse_search_result(item)
+                        if result and result["url"] not in seen_urls:
+                            if content_type and result.get("type") != content_type:
+                                continue
+                            seen_urls.add(result["url"])
+                            results.append(result)
+            except Exception as e:
+                pass
+
+        return results
     
     def _parse_search_result(self, item) -> Optional[Dict]:
         try:

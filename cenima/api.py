@@ -2,12 +2,16 @@ from pydantic import BaseModel
 from typing import List, Optional, Any, Dict
 from urllib.parse import urljoin
 import re
+import shlex
 
 # Import existing scraper and processor
 from .scraper import TopCinemaScraper, clean_arabic_title, clean_show_title
 from .processor import VidTubeProcessor
+from .history import HistoryManager
+from .models import SearchResult, ShowDetails, StreamSource, Episode, Season, WatchProgress, HistoryResponse
 
 scraper = TopCinemaScraper()
+history_manager = HistoryManager()
 
 try:
     from fastapi import FastAPI, HTTPException, Query, Path
@@ -144,23 +148,36 @@ async def resolve_stream(
     url: str = Query(..., description="Episode/Movie watch URL")
 ):
     content_dummy = {"url": url}
-    
+
     servers = await run_in_threadpool(scraper.fetch_episode_servers, content_dummy)
-    
+
     if not servers:
         raise HTTPException(status_code=404, detail="No working VidTube servers found")
-    
+
     selected = servers[0]
-    referer = scraper.base_url
-    ua = scraper.session.headers["User-Agent"]
-    mpv_cmd = f'mpv "{selected["video_url"]}" --referrer="{referer}" --user-agent="{ua}" --vo=gpu --x11-bypass-compositor=no'
+    video_url = selected.get("video_url")
+    if not video_url:
+        raise HTTPException(status_code=404, detail="Could not extract a direct video URL")
+
+    referer = selected.get("embed_url") or scraper.base_url
+    ua = scraper.session.headers.get("User-Agent", "Mozilla/5.0")
+
+    # Safe structured launch data (no fragile shell-string interpolation).
+    mpv_arguments = [
+        "mpv",
+        video_url,
+    ]
+    # Copy-pasteable shell command, properly quoted/escaped.
+    mpv_command = " ".join(shlex.quote(a) for a in mpv_arguments)
 
     return StreamSource(
-        server_number=selected["server_number"],
-        embed_url=selected["embed_url"],
-        video_url=selected["video_url"],
+        server_number=selected.get("server_number"),
+        embed_url=selected.get("embed_url"),
+        video_url=video_url,
         headers={"Referer": referer, "User-Agent": ua},
-        mpv_command=mpv_cmd
+        quality=selected.get("quality"),
+        mpv_command=mpv_command,
+        mpv_arguments=mpv_arguments,
     )
 
 @app.get("/vidtube/extract")
@@ -169,6 +186,32 @@ async def extract_direct(url: str):
     if not video_url:
         raise HTTPException(404, "Could not extract video")
     return {"video_url": video_url}
+
+@app.get("/history", response_model=HistoryResponse)
+async def get_history(limit: int = Query(20, ge=1, le=100)):
+    items = history_manager.get_recent_history(limit=limit)
+    return HistoryResponse(items=items, total=len(items))
+
+@app.post("/history/update", response_model=WatchProgress)
+async def update_history(item: WatchProgress):
+    return history_manager.update_progress(
+        show_title=item.show_title,
+        season_number=item.season_number,
+        episode_number=item.episode_number,
+        time_pos=item.time_pos,
+        duration=item.duration,
+        show_url=item.show_url,
+        content_type=item.content_type,
+        season_label=item.season_label,
+        episode_title=item.episode_title,
+        episode_url=item.episode_url,
+    )
+
+@app.delete("/history")
+async def clear_history():
+    history_manager.clear_history()
+    return {"status": "ok", "message": "Watch history cleared"}
+
 
 if __name__ == "__main__":
     import uvicorn

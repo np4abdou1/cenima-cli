@@ -21,8 +21,12 @@ from rich.table import Table
 from rich.markup import escape
 from rich.panel import Panel
 from rich.style import Style
+from rich.progress_bar import ProgressBar
 
 from .scraper import TopCinemaScraper, clean_show_title
+from .history import HistoryManager
+from .models import WatchStatus
+from .mpv import run_mpv_monitored
 
 scraper = TopCinemaScraper()
 from .config import (
@@ -37,7 +41,18 @@ GITHUB_REPO_URL = "https://github.com/np4abdou1/cenima-cli"
 GITHUB_API_URL = "https://api.github.com/repos/np4abdou1/cenima-cli"
 
 
+def format_seconds(secs: float) -> str:
+    if not secs or secs < 0:
+        return "00:00"
+    m, s = divmod(int(secs), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
 def get_github_stars() -> int:
+
     cache_file = CONFIG_DIR / "stars_cache.json"
     cache_duration = 3600
     
@@ -80,6 +95,14 @@ class Config:
     
     def __init__(self):
         self.theme = DEFAULT_THEME
+        # Player options
+        self.simple_mode = True   # Launch mpv minimally (mirrors the known-good command)
+        self.send_headers = False # Inject --referrer/--user-agent when simple_mode is on
+        self.referer = ""
+        self.user_agent = ""
+        self.fullscreen = True
+        self.hwdec = False
+        self.cache_pause = False
         self.load()
     
     def load(self):
@@ -87,15 +110,34 @@ class Config:
             if CONFIG_FILE.exists():
                 data = json.loads(CONFIG_FILE.read_text())
                 self.theme = data.get("theme", DEFAULT_THEME)
+                self.simple_mode = bool(data.get("simple_mode", True))
+                self.send_headers = bool(data.get("send_headers", False))
+                self.referer = data.get("referer", "")
+                self.user_agent = data.get("user_agent", "")
+                self.fullscreen = bool(data.get("fullscreen", True))
+                self.hwdec = bool(data.get("hwdec", False))
+                self.cache_pause = bool(data.get("cache_pause", False))
         except Exception:
             pass
     
     def save(self):
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            CONFIG_FILE.write_text(json.dumps({"theme": self.theme}, indent=2))
+            CONFIG_FILE.write_text(json.dumps(self.to_dict(), indent=2))
         except Exception:
             pass
+    
+    def to_dict(self) -> Dict:
+        return {
+            "theme": self.theme,
+            "simple_mode": self.simple_mode,
+            "send_headers": self.send_headers,
+            "referer": self.referer,
+            "user_agent": self.user_agent,
+            "fullscreen": self.fullscreen,
+            "hwdec": self.hwdec,
+            "cache_pause": self.cache_pause,
+        }
     
     def get_theme(self) -> Dict:
         return THEMES.get(self.theme, THEMES[DEFAULT_THEME])
@@ -104,6 +146,7 @@ class Config:
 class CinemaCLI:
     def __init__(self):
         self.config = Config()
+        self.history = HistoryManager()
         self.picker_hint = "↑↓ navigate • Enter select • Esc back"
         self.current_show_title = ""
         self.current_overview_panel = None
@@ -112,6 +155,7 @@ class CinemaCLI:
         self.current_season = None
         self.github_stars = None  # Lazy load
         self.check_deps()
+
     
     @property
     def theme(self) -> Dict:
@@ -307,6 +351,9 @@ class CinemaCLI:
         if cmd == "/theme":
             self.theme_selector()
             return True
+        elif cmd in ("/history", "/recent"):
+            self.show_history_menu()
+            return True
         elif cmd == "/help":
             self.show_help()
             return True
@@ -317,6 +364,78 @@ class CinemaCLI:
             return True
         
         return False
+
+    def show_history_menu(self):
+        self.banner()
+        theme = self.theme
+        history_items = self.history.get_recent_history(limit=30)
+        
+        if not history_items:
+            self.log("ℹ️", "No watch history yet", theme['secondary'])
+            input("\nPress Enter to continue...")
+            return
+
+        def fmt_history_item(item):
+            badge = "👁️" if item.status == WatchStatus.COMPLETED or item.progress_pct >= 85 else "⏳" if item.status == WatchStatus.IN_PROGRESS else "📺"
+            title = escape(item.show_title)
+            
+            detail = ""
+            if item.season_number or item.episode_number:
+                s_str = f"S{item.season_number}" if item.season_number else ""
+                e_str = f"E{item.episode_number}" if item.episode_number else ""
+                detail = f" — {s_str}{e_str}".strip()
+                if item.episode_title:
+                    detail += f" ({item.episode_title})"
+            
+            prog_str = ""
+            if item.duration > 0:
+                pos_fmt = format_seconds(item.time_pos)
+                dur_fmt = format_seconds(item.duration)
+                prog_str = f" \033[33m[{int(item.progress_pct)}% · {pos_fmt}/{dur_fmt}]\033[0m"
+            elif item.status == WatchStatus.COMPLETED:
+                prog_str = " \033[32m[Watched]\033[0m"
+            
+            return f"{badge} \033[1m{title}\033[0m{detail}{prog_str}"
+
+        header = f"📊 {len(history_items)} items in history"
+        selected = self.run_fzf_objects(
+            history_items,
+            fmt_history_item,
+            prompt="🕒 History ❯ ",
+            title="🕒 Recent Watch History",
+            subtitle=header,
+            header=header
+        )
+
+        if selected:
+            options = [
+                f"🔍 Search '{selected.show_title}'",
+                "🗑️ Clear Watch History",
+                "⬅️ Back"
+            ]
+            choice_idx = self.run_fzf(
+                options,
+                prompt="❯ ",
+                title=f"🕒 {selected.show_title}",
+                header="Action for selected history item"
+            )
+            if choice_idx == 0:
+                asyncio.run(self.search_and_open(selected.show_title))
+            elif choice_idx == 1:
+                self.history.clear_history()
+                self.log("✓", "History cleared", theme['primary'])
+                time.sleep(1)
+
+    async def search_and_open(self, query: str):
+        self.banner()
+        theme = self.theme
+        self.log("🔄", f"Searching '{query}'...")
+        results = await asyncio.to_thread(scraper.search, query)
+        if results:
+            await self.show_details_flow(results[0])
+        else:
+            self.log("⚠️", "No matching show found", theme['error'])
+            await asyncio.sleep(1.5)
     
     def theme_selector(self):
         theme_names = list(THEMES.keys())
@@ -349,6 +468,12 @@ class CinemaCLI:
         theme = self.theme
         
         CONSOLE.print(f"[bold {theme['primary']}]📚 Commands[/bold {theme['primary']}]")
+        CONSOLE.print("[dim]/history - View recent watch history & continue watching[/dim]")
+        CONSOLE.print("[dim]/theme   - Change color theme[/dim]")
+        CONSOLE.print("[dim]/help    - Show this help[/dim]")
+        CONSOLE.print("[dim]/version - Show version info[/dim]")
+        CONSOLE.print("[dim]exit     - Quit the application[/dim]")
+
         CONSOLE.print("[dim]/theme   - Change color theme[/dim]")
         CONSOLE.print("[dim]/help    - Show this help[/dim]")
         CONSOLE.print("[dim]/version - Show version info[/dim]")
@@ -533,7 +658,24 @@ class CinemaCLI:
     def _format_episode_label(self, episode):
         num_raw = episode.get('display_number') or episode.get('episode_number')
         num_label = self._normalize_episode_number(num_raw)
-        return f"📺 Episode {num_label}"
+        title = self._clean_episode_title(episode.get('title', ''), num_label)
+        
+        season_num = self.current_season.get('season_number') if self.current_season else None
+        prog = self.history.get_progress(self.current_show_title, season_num, num_label)
+        
+        badge = "📺"
+        status_str = ""
+        if prog:
+            if prog.status == WatchStatus.COMPLETED or prog.progress_pct >= 85.0:
+                badge = "👁️ "
+                status_str = " \033[32m[Watched]\033[0m"
+            elif prog.status == WatchStatus.IN_PROGRESS and prog.progress_pct > 0:
+                badge = "⏳"
+                pos_fmt = format_seconds(prog.time_pos)
+                status_str = f" \033[33m[{int(prog.progress_pct)}% · {pos_fmt}]\033[0m"
+        
+        title_str = f" · {title}" if title else ""
+        return f"{badge} Episode {num_label}{title_str}{status_str}"
     
     def _display_show_overview(self, details):
         title = clean_show_title(details.get("title", ""))
@@ -600,11 +742,11 @@ class CinemaCLI:
         
         while True:
             def fmt_season(season):
-                label = season.get('display_label')
-                if not label:
-                    num = season.get('season_number', '?')
-                    label = f"Season {num}"
-                return f"📂 {label}"
+                num = season.get('season_number', 1)
+                label = season.get('display_label') or f"Season {num}"
+                watched_cnt, _ = self.history.get_season_stats(self.current_show_title, num)
+                stats_str = f" \033[32m(👁️ {watched_cnt} watched)\033[0m" if watched_cnt > 0 else ""
+                return f"📂 {label}{stats_str}"
             
             season_header = f"📊 {season_count} seasons"
             selected_season = self.run_fzf_objects(
@@ -682,6 +824,7 @@ class CinemaCLI:
         
         episode_num = self._normalize_episode_number(episode.get('episode_number') or episode.get('display_number'))
         episode_title = self._clean_episode_title(episode.get('title', ''), episode_num)
+        season_num = self.current_season.get('season_number') if self.current_season else None
         
         self.banner()
         if self.current_overview_panel:
@@ -712,9 +855,16 @@ class CinemaCLI:
         if episode_title:
             display_context += f" · {episode_title}"
         
-        await self.select_and_play(servers, display_context, is_episode=True)
+        await self.select_and_play(
+            servers,
+            display_context,
+            is_episode=True,
+            season_num=season_num,
+            ep_num=episode_num,
+            ep_title=episode_title
+        )
     
-    async def select_and_play(self, servers, title_context, is_episode=False):
+    async def select_and_play(self, servers, title_context, is_episode=False, season_num=None, ep_num=None, ep_title=None):
         theme = self.theme
         
         if not servers:
@@ -734,7 +884,15 @@ class CinemaCLI:
         self.log("▶️", "Launching player...")
         await asyncio.sleep(0.3)
         
-        self.play_video(video_url, referer, title_context)
+        self.play_video(
+            video_url,
+            referer=referer,
+            title=title_context,
+            season_num=season_num,
+            ep_num=ep_num,
+            ep_title=ep_title,
+            content_type="series" if is_episode else "movie"
+        )
         
         if is_episode and self.current_episodes:
             await self.prompt_next_episode()
@@ -770,66 +928,71 @@ class CinemaCLI:
         elif idx == 1:
             pass
     
-    def play_video(self, url, referer, title=""):
+    def _build_mpv_command(self, url, referer=None, title=None, sock=None):
+        """Build the mpv argv with 0 extra arguments: mpv <url>."""
+        return ["mpv", url]
+
+    def play_video(
+        self,
+        url: str,
+        referer: str = "",
+        title: str = "",
+        season_num: Optional[int] = None,
+        ep_num: Optional[str] = None,
+        ep_title: Optional[str] = None,
+        content_type: str = "movie"
+    ):
         theme = self.theme
-        ua = scraper.session.headers.get("User-Agent", "Mozilla/5.0")
-        
-        cmd = [
-            "mpv",
-            url,
-            f"--referrer={referer}",
-            f"--user-agent={ua}",
-            "--vo=gpu",
-            "--hwdec=auto",
-            "--x11-bypass-compositor=no",
-            "--fs",
-            "--cache=yes",
-            "--cache-secs=300",
-            "--demuxer-max-bytes=200MiB",
-            "--demuxer-max-back-bytes=100MiB",
-            "--cache-pause-initial=yes",
-            "--cache-pause-wait=5",
-            "--network-timeout=30",
-            f"--force-media-title={title}",
-            "--osd-level=1",
-            "--osd-duration=2000",
-            "--really-quiet",
-            "--msg-level=all=no"
-        ]
-        
+        prog = self.history.get_progress(self.current_show_title, season_num, ep_num)
+        start_time = 0.0
+
+        if prog and prog.time_pos > 10.0 and prog.status != WatchStatus.COMPLETED:
+            pos_fmt = format_seconds(prog.time_pos)
+            pct_int = int(prog.progress_pct)
+            options = [
+                f"▶️  Resume from {pos_fmt} ({pct_int}%)",
+                "🔄  Start from beginning (00:00)"
+            ]
+            choice = self.run_fzf(
+                options,
+                prompt="▶️ Playback ❯ ",
+                title=f"▶️ Saved Progress: {pos_fmt}",
+                header=f"Resume {title} at {pos_fmt}?"
+            )
+            if choice == 0:
+                start_time = prog.time_pos
+
         CONSOLE.clear()
-        
-        content = f"""
-[bold white]{title}[/bold white]
+        self.log("🎬", f"Playing {title}...", f"bold {theme['primary']}")
 
-[{theme['secondary']}]🔄 Buffering video stream...[/{theme['secondary']}]
-[dim]Connection established. Waiting for buffer fill...[/dim]
+        rc, mpv_state = run_mpv_monitored(
+            url=url,
+            title=title or self.current_show_title or "cenima-cli",
+            start_time=start_time
+        )
 
-[bold {theme['primary']}]Controls:[/bold {theme['primary']}]
-• [bold]q[/bold]     Quit player
-• [bold]Space[/bold] Pause/Resume
-• [bold]f[/bold]     Toggle Fullscreen
-• [bold]m[/bold]     Mute
-"""
-        CONSOLE.print(Panel(
-            content.strip(),
-            title=f"[bold {theme['primary']}]🎬  NOW PLAYING[/bold {theme['primary']}]",
-            border_style=theme['primary'],
-            padding=(1, 2)
-        ))
-        
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            CONSOLE.clear()
-            if result.returncode == 0:
-                self.log("✓", "Playback finished", f"bold {theme['primary']}")
+        if mpv_state and mpv_state.time_pos and mpv_state.time_pos > 5:
+            saved_prog = self.history.update_progress(
+                show_title=self.current_show_title or title,
+                season_number=season_num,
+                episode_number=ep_num,
+                time_pos=mpv_state.time_pos,
+                duration=mpv_state.duration or (prog.duration if prog else 0.0),
+                content_type=content_type,
+                episode_title=ep_title,
+                episode_url=url
+            )
+            if saved_prog.status == WatchStatus.COMPLETED:
+                self.log("👁️", f"Marked as Watched ({int(saved_prog.progress_pct)}%)", f"bold {theme['primary']}")
             else:
-                pass
-                
-        except Exception as e:
-            self.log("✗", f"Player error: {e}", theme['error'])
-            input("Press Enter to continue...")
+                pos_fmt = format_seconds(saved_prog.time_pos)
+                self.log("💾", f"Saved progress at {pos_fmt} ({int(saved_prog.progress_pct)}%)", theme['secondary'])
+
+        if rc in (0, None):
+            self.log("✓", "Playback finished", f"bold {theme['primary']}")
+        else:
+            self.log("⚠️", f"MPV exited with code {rc}", theme["error"])
+
 
 
 def main():

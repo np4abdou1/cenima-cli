@@ -5,12 +5,23 @@ __version__ = "0.2"
 __author__ = "np4abdou1"
 __license__ = "GPL-3.0"
 
-# --- Directories ---
+# --- Directories & Persistence ---
 CONFIG_DIR = Path.home() / ".config" / "cenima-cli"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+HISTORY_FILE = CONFIG_DIR / "history.json"
+COMPLETED_THRESHOLD = 0.85
 
 # --- Scraper Configuration ---
-BASE_URL = "https://topcinemaa.cc"
+BASE_URL = "https://topcinemaa.co"
+
+MIRROR_DOMAINS = [
+    "https://topcinemaa.co",
+    "https://topcinemaa.cc",
+    "https://topcinema.media",
+    "https://topcinema.cam",
+    "https://topcinema.site",
+]
+DOMAIN_CACHE_FILE = CONFIG_DIR / "domain_cache.json"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
