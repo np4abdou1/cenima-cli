@@ -43,26 +43,36 @@ def clean_arabic_title(text: str) -> str:
     return text.strip()
 
 def clean_show_title(title: str) -> str:
-    cleaned = clean_arabic_title(title)
-    
-    if cleaned.lower() == 'topcinema':
+    if not title:
         return ""
-
-    junk_patterns = [
+        
+    t = title
+    
+    # 1. Strip season and episode indicators (with Arabic and English prefixes & words) BEFORE stripping Arabic letters
+    meta_patterns = [
+        # Arabic & English season indicators (e.g. الموسم الرابع, الموسم 4, Season 4, S04)
+        r'\b(?:season)\s*\d*\b|\b[sS]\d+\b|\bالموسم\s*(?:الاول|الأول|الثاني|الثالث|الرابع|الخامس|السادس|السابع|الثامن|التاسع|العاشر|\d+)?',
+        # Arabic & English episode indicators (e.g. الحلقة 13, الحلقة 1 و 2, Episode 13, Ep 13, E13)
+        r'\b(?:episode|ep)\s*\d*\b|\b[eE]\d+\b|\b(?:الحلقة|حلقة)\s*(?:\d+(?:\s*(?:و|-|to|&|and)\s*\d+)*|\bال[^\s]+\b)?',
+        # Part indicators (e.g. الجزء الثاني, Part 2)
+        r'\b(?:part)\s*\d*\b|\bالجزء\s*(?:الاول|الأول|الثاني|الثالث|الرابع|الخامس|\d+)?',
+        # Quality & release tags
         r'\b(?:1080p|720p|480p|360p)\b',
-        r'\b(?:WEB-DL|BluRay|HDTV|CAM)\b',
+        r'\b(?:WEB-DL|BluRay|HDTV|CAM|WEBRip|HDRip)\b',
         r'\b(?:x264|x265|HEVC)\b',
         r'\b(?:\d{1,2}\.\d)\b',
         r'[★⭐]\s*\d+\.?\d*',
         r'\[\s*\d+\.?\d*\s*\]',
-        r'\b(?:Season|الموسم)\s*\d+',
-        r'\b(?:Episode|الحلقة)\s*\d+',
     ]
+    for pattern in meta_patterns:
+        t = re.sub(pattern, '', t, flags=re.IGNORECASE)
     
-    for pattern in junk_patterns:
-        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+    cleaned = clean_arabic_title(t)
     
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    if cleaned.lower() == 'topcinema':
+        return ""
+
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip(' .-_:')
     return cleaned
 
 def parse_episode_number(ep_str: str) -> float:
@@ -176,15 +186,59 @@ class TopCinemaScraper:
             self.vidtube_processor.headers["Referer"] = self.base_url
             self.vidtube_processor.headers["Origin"] = self.base_url
 
+    def _save_domain_cache(self, domain: str):
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            DOMAIN_CACHE_FILE.write_text(json.dumps({
+                "domain": domain,
+                "timestamp": time.time()
+            }))
+        except Exception:
+            pass
+
+    def _handle_response_redirect(self, response):
+        """Detect and adapt to 301/302 redirects to new TopCinema domains dynamically."""
+        try:
+            if response and getattr(response, "url", None):
+                parsed = urlparse(response.url)
+                if "topcinema" in parsed.netloc.lower():
+                    resolved = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
+                    if resolved != self.base_url:
+                        self._set_active_domain(resolved)
+                        self._save_domain_cache(resolved)
+        except Exception:
+            pass
+
+    def _normalize_url_domain(self, url: str) -> str:
+        """Rewrite legacy TopCinema domains to the current active domain while preserving the path."""
+        if not url:
+            return url
+        try:
+            parsed = urlparse(url)
+            if "topcinema" in parsed.netloc.lower():
+                current_parsed = urlparse(self.base_url)
+                return url.replace(f"{parsed.scheme}://{parsed.netloc}", f"{current_parsed.scheme}://{current_parsed.netloc}")
+        except Exception:
+            pass
+        return url
+
     def _discover_domain(self, force: bool = False) -> str:
         """Find active working domain by probing mirrors and following 301/302 redirects."""
         if not force and DOMAIN_CACHE_FILE.exists():
             try:
                 cache_data = json.loads(DOMAIN_CACHE_FILE.read_text())
                 cached_url = cache_data.get("domain")
-                if cached_url and time.time() - cache_data.get("timestamp", 0) < 86400:
-                    self._set_active_domain(cached_url)
-                    return self.base_url
+                # Quick verification probe to check for 301/302 redirect on the cached domain
+                if cached_url:
+                    resp = self.session.get(cached_url, timeout=4, allow_redirects=True)
+                    if resp.status_code == 200:
+                        parsed = urlparse(resp.url)
+                        if "topcinema" in parsed.netloc.lower():
+                            resolved = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
+                            self._set_active_domain(resolved)
+                            if resolved != cached_url:
+                                self._save_domain_cache(resolved)
+                            return self.base_url
             except Exception:
                 pass
 
@@ -196,22 +250,15 @@ class TopCinemaScraper:
 
         for cand in candidates:
             try:
-                response = self.session.get(cand, timeout=6, allow_redirects=True)
+                response = self.session.get(cand, timeout=5, allow_redirects=True)
                 if response.status_code == 200:
                     parsed = urlparse(response.url)
-                    resolved = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
-                    self._set_active_domain(resolved)
-                    
-                    try:
-                        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-                        DOMAIN_CACHE_FILE.write_text(json.dumps({
-                            "domain": resolved,
-                            "timestamp": time.time()
-                        }))
-                    except Exception:
-                        pass
-                        
-                    return resolved
+                    # Verify target domain is indeed a TopCinema domain (skip ad parking redirects)
+                    if "topcinema" in parsed.netloc.lower():
+                        resolved = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
+                        self._set_active_domain(resolved)
+                        self._save_domain_cache(resolved)
+                        return resolved
             except Exception:
                 continue
 
@@ -244,6 +291,7 @@ class TopCinemaScraper:
                 timeout=REQUEST_TIMEOUT,
                 allow_redirects=True
             )
+            self._handle_response_redirect(response)
             
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, "html.parser")
@@ -269,6 +317,7 @@ class TopCinemaScraper:
                     timeout=REQUEST_TIMEOUT,
                     allow_redirects=True
                 )
+                self._handle_response_redirect(response)
                 if response.status_code == 200:
                     soup = BeautifulSoup(response.text, "html.parser")
                     for item in soup.select(".Small--Box"):
@@ -281,7 +330,50 @@ class TopCinemaScraper:
             except Exception as e:
                 pass
 
-        return results
+        return self._deduplicate_search_results(results)
+
+    def _deduplicate_search_results(self, results: List[Dict]) -> List[Dict]:
+        deduped = []
+        seen = {}
+        
+        for r in results:
+            content_type = r.get('type', 'unknown')
+            raw_title = r.get('title', '')
+            cleaned_name = clean_show_title(raw_title)
+            norm_key_name = cleaned_name.lower() if cleaned_name else raw_title.lower()
+            
+            if content_type in ('series', 'anime'):
+                key = (content_type, norm_key_name)
+            elif content_type == 'movie':
+                year = r.get('metadata', {}).get('year')
+                key = (content_type, norm_key_name, year) if year else (content_type, norm_key_name)
+            else:
+                key = (content_type, r.get('url'))
+                
+            if key not in seen:
+                seen[key] = len(deduped)
+                entry = dict(r)
+                deduped.append(entry)
+            else:
+                idx = seen[key]
+                existing = deduped[idx]
+                curr_url = unquote(r.get('url', ''))
+                exist_url = unquote(existing.get('url', ''))
+                
+                # Prefer canonical /series/ or /anime/ landing page URL over individual episode post URLs
+                is_curr_canonical = ('/series/' in curr_url or '/anime/' in curr_url) and not ('الحلقة' in curr_url or 'episode' in curr_url.lower())
+                is_exist_canonical = ('/series/' in exist_url or '/anime/' in exist_url) and not ('الحلقة' in exist_url or 'episode' in exist_url.lower())
+                
+                if is_curr_canonical and not is_exist_canonical:
+                    existing['url'] = r['url']
+                    existing['title'] = r['title']
+                
+                # Merge richer metadata if missing in existing
+                for meta_k, meta_v in r.get('metadata', {}).items():
+                    if meta_v and not existing.get('metadata', {}).get(meta_k):
+                        existing.setdefault('metadata', {})[meta_k] = meta_v
+                        
+        return deduped
     
     def _parse_search_result(self, item) -> Optional[Dict]:
         try:
@@ -374,8 +466,10 @@ class TopCinemaScraper:
             return None
     
     def get_movie_details(self, url: str) -> Optional[Dict]:
+        url = self._normalize_url_domain(url)
         try:
-            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+            response = self.session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            self._handle_response_redirect(response)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.text, "html.parser")
@@ -406,8 +500,8 @@ class TopCinemaScraper:
                 except Exception as e:
                     pass
             
-            if movie_id:
-                details["servers"] = self.get_servers(movie_id, watch_url)
+            # Fetch direct streaming/download servers (excluding browser embeds)
+            details["servers"] = self.get_servers(movie_id or "", url)
             
             return details
         
@@ -416,8 +510,10 @@ class TopCinemaScraper:
             return None
     
     def get_series_details(self, url: str, show_type: str = "series") -> Optional[Dict]:
+        url = self._normalize_url_domain(url)
         try:
-            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+            response = self.session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            self._handle_response_redirect(response)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.text, "html.parser")
@@ -593,6 +689,7 @@ class TopCinemaScraper:
         return metadata
     
     def _parse_season(self, season_url: str) -> Optional[Dict]:
+        season_url = self._normalize_url_domain(season_url)
         try:
             season_num = extract_season_number(season_url)
             
@@ -642,7 +739,8 @@ class TopCinemaScraper:
                         current_url = f"{first_try_url}/?page={page}"
                 
                 try:
-                    response = self.session.get(current_url, timeout=REQUEST_TIMEOUT)
+                    response = self.session.get(current_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+                    self._handle_response_redirect(response)
                     
                     # If /list 404s, try fallback immediately
                     if response.status_code == 404 and page == 1 and use_list_endpoint and not fallback_mode:
@@ -731,7 +829,8 @@ class TopCinemaScraper:
             all_episodes.sort(key=lambda e: parse_episode_number(e.get("episode_number", "")))
             
             # Get poster from first page
-            response = self.session.get(base_url + '/', timeout=REQUEST_TIMEOUT)
+            response = self.session.get(base_url + '/', timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            self._handle_response_redirect(response)
             soup = BeautifulSoup(response.text, "html.parser")
             poster = None
             poster_img = soup.find("img", class_=re.compile("poster"))
@@ -804,8 +903,22 @@ class TopCinemaScraper:
                 
                 display_num = f"{special_type} {ep_num_str}" if special_type else ep_num_str
             
-            # Clean the title - remove episode numbers from title text
+            # Clean the title - remove episode numbers, quality, ratings, and metadata tags
             clean_title = clean_arabic_title(ep_text or title_attr or "")
+            junk_patterns = [
+                r'\b(?:1080p|720p|480p|360p)\b',
+                r'\b(?:WEB-DL|BluRay|HDTV|CAM)\b',
+                r'\b(?:x264|x265|HEVC)\b',
+                r'\b\d+\.\d*\b',
+                r'\b\.\d+\b',
+                r'\b\d+\.\b',
+                r'[★⭐]\s*\d+\.?\d*',
+                r'\[\s*\d+\.?\d*\s*\]',
+                r'\b(?:Season|الموسم)\s*\d+',
+                r'\b(?:Episode|الحلقة)\s*\d+',
+            ]
+            for pat in junk_patterns:
+                clean_title = re.sub(pat, '', clean_title, flags=re.IGNORECASE)
             # Remove the episode number from title if it's just duplicating
             clean_title = re.sub(r'\b' + re.escape(str(ep_num_str)) + r'\b', '', clean_title).strip()
             if not clean_title or clean_title.isspace():
@@ -839,41 +952,44 @@ class TopCinemaScraper:
 
     def get_servers(self, content_id: str, referer: str, max_servers: int = 10) -> List[Dict]:
         servers = []
+        seen_urls = set()
         
-        headers = AJAX_HEADERS.copy()
-        headers["Referer"] = referer
-        headers["Origin"] = self.base_url
+        referer = self._normalize_url_domain(referer)
+        # Parse genuine direct download/streaming server links from the /download/ page (VideoTube, UpDown, etc.)
+        # Excludes browser iframe embeds completely as cenima-cli streams directly in mpv.
+        clean_base = re.sub(r'/(?:watch|download)/?$', '', referer.rstrip('/'))
+        dl_candidates = [
+            f"{clean_base}/download/",
+            clean_base,
+            referer
+        ]
         
-        for i in range(max_servers):
+        for dl_url in dl_candidates:
             try:
-                data = {"id": str(content_id), "i": str(i)}
-                response = self.session.post(
-                    self._get_endpoint("server"),
-                    headers=headers,
-                    data=data,
-                    timeout=5
-                )
-                
-                if response.status_code == 200:
-                    soup = BeautifulSoup(response.text, "html.parser")
-                    iframe = soup.find("iframe")
-                    
-                    if iframe and iframe.get("src"):
-                        embed_url = iframe["src"].strip()
-                        
-                        if 'vidtube' in embed_url.lower():
-                            video_url = self._extract_vidtube_url(embed_url, referer=referer)
+                resp_page = self.session.get(dl_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+                self._handle_response_redirect(resp_page)
+                if resp_page.status_code == 200:
+                    soup_page = BeautifulSoup(resp_page.text, "html.parser")
+                    download_anchors = soup_page.select("a.downloadsLink")
+                    if download_anchors:
+                        for a in download_anchors:
+                            href = a.get("href")
+                            if not href or href in seen_urls:
+                                continue
+                            seen_urls.add(href)
                             
-                            if video_url:
-                                servers.append({
-                                    "name": f"VidTube Server {i+1}",
-                                    "server_number": i,
-                                    "embed_url": embed_url,
-                                    "video_url": video_url
-                                })
-                                break
+                            server_label = a.select_one("span").text.strip() if a.select_one("span") else "Server"
+                            quality_label = a.select_one("p").text.strip() if a.select_one("p") else ""
+                            display_name = f"{server_label} ({quality_label})" if quality_label else server_label
                             
-            except Exception as e:
+                            servers.append({
+                                "name": f"⚡ {display_name}",
+                                "server_number": len(servers),
+                                "embed_url": href,
+                                "video_url": None  # Resolved lazily or during health check
+                            })
+                        break
+            except Exception:
                 pass
         
         return servers
@@ -881,7 +997,9 @@ class TopCinemaScraper:
     def _extract_content_id(self, url: str, soup: Optional[BeautifulSoup] = None) -> Optional[str]:
         try:
             if not soup:
-                response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+                url = self._normalize_url_domain(url)
+                response = self.session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+                self._handle_response_redirect(response)
                 soup = BeautifulSoup(response.text, "html.parser")
             
             # 1. Check for Li elements in the server list (MOST RELIABLE for movies)
@@ -998,10 +1116,7 @@ class TopCinemaScraper:
             return []
         
         episode_id = self._extract_content_id(url)
-        if not episode_id:
-            return []
-        
-        servers = self.get_servers(episode_id, url)
+        servers = self.get_servers(episode_id or "", url)
         episode["servers"] = servers
         return servers
     

@@ -39,29 +39,6 @@ if HAS_FASTAPI:
 else:
     app = None
 
-def clean_show_title(title: str) -> str:
-    cleaned = clean_arabic_title(title)
-    
-    if cleaned.lower() == 'topcinema':
-        return ""
-
-    junk_patterns = [
-        r'\b(?:1080p|720p|480p|360p)\b',
-        r'\b(?:WEB-DL|BluRay|HDTV|CAM)\b',
-        r'\b(?:x264|x265|HEVC)\b',
-        r'\b(?:\d{1,2}\.\d)\b',
-        r'[★⭐]\s*\d+\.?\d*',
-        r'\[\s*\d+\.?\d*\s*\]',
-        r'\b(?:Season|الموسم)\s*\d+',
-        r'\b(?:Episode|الحلقة)\s*\d+',
-    ]
-    
-    for pattern in junk_patterns:
-        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
-    
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned
-
 def transform_search_result(res: dict) -> SearchResult:
     meta = res.get("metadata", {})
     return SearchResult(
@@ -159,21 +136,35 @@ async def resolve_stream(
     if not video_url:
         raise HTTPException(status_code=404, detail="Could not extract a direct video URL")
 
-    referer = selected.get("embed_url") or scraper.base_url
-    ua = scraper.session.headers.get("User-Agent", "Mozilla/5.0")
+    referer = getattr(video_url, "referer", None) or selected.get("embed_url") or scraper.base_url
+    ua = getattr(video_url, "headers", {}).get("User-Agent") or scraper.session.headers.get("User-Agent", "Mozilla/5.0")
 
-    # Safe structured launch data (no fragile shell-string interpolation).
-    mpv_arguments = [
-        "mpv",
-        video_url,
-    ]
+    is_vidtube = any(k in str(video_url).lower() for k in ["cdn-video", "serv-stream", "vidtube"]) or \
+                 bool(referer and any(k in str(referer).lower() for k in ["vidtube", "cdn-video"]))
+
+    if is_vidtube:
+        if not referer or not any(k in str(referer).lower() for k in ["vidtube", "down.vidtube.one"]):
+            referer = "https://down.vidtube.one/"
+        if not ua:
+            ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        mpv_arguments = [
+            "mpv",
+            f"--referrer={referer}",
+            f"--user-agent={ua}",
+            str(video_url),
+        ]
+    else:
+        mpv_arguments = [
+            "mpv",
+            str(video_url),
+        ]
     # Copy-pasteable shell command, properly quoted/escaped.
     mpv_command = " ".join(shlex.quote(a) for a in mpv_arguments)
 
     return StreamSource(
         server_number=selected.get("server_number"),
         embed_url=selected.get("embed_url"),
-        video_url=video_url,
+        video_url=str(video_url),
         headers={"Referer": referer, "User-Agent": ua},
         quality=selected.get("quality"),
         mpv_command=mpv_command,

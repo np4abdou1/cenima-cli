@@ -12,14 +12,16 @@ HISTORY_FILE = CONFIG_DIR / "history.json"
 COMPLETED_THRESHOLD = 0.85
 
 # --- Scraper Configuration ---
-BASE_URL = "https://topcinemaa.co"
+BASE_URL = "https://topcinema.film"
 
 MIRROR_DOMAINS = [
+    "https://topcinema.film",
+    "https://topcinema.cam",
+    "https://topcinemaa.top",
+    "https://topcinema.red",
     "https://topcinemaa.co",
     "https://topcinemaa.cc",
     "https://topcinema.media",
-    "https://topcinema.cam",
-    "https://topcinema.site",
 ]
 DOMAIN_CACHE_FILE = CONFIG_DIR / "domain_cache.json"
 
@@ -71,8 +73,11 @@ GOODBYE_ART = r"""
       |__/       
 """
 
+from .accent import get_auto_theme, detect_system_accent
+
 # --- Theme Definitions ---
 THEMES = {
+    "auto": get_auto_theme(),
     "blue": {"primary": "#7eb3d4", "secondary": "#9ac9e3", "accent": "#5a9bc7", "error": "#d97979"},
     "red": {"primary": "#d97979", "secondary": "#e59393", "accent": "#c55a5a", "error": "#d97979"},
     "green": {"primary": "#8ba87f", "secondary": "#a3ba98", "accent": "#6d8a62", "error": "#d97979"},
@@ -92,7 +97,7 @@ THEMES = {
     "sunset": {"primary": "#e48b7a", "secondary": "#f0a19a", "accent": "#c66d5c", "error": "#d97979"},
 }
 
-DEFAULT_THEME = "cyan"
+DEFAULT_THEME = "auto"
 
 # --- Spinners ---
 SPINNERS = ["dots", "dots2", "dots3", "line", "star", "growVertical", "arc", "bouncingBar", "aesthetic"]

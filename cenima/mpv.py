@@ -176,6 +176,8 @@ def run_mpv_monitored(
     title: Optional[str] = None,
     start_time: float = 0.0,
     extra_args: Optional[List[str]] = None,
+    referer: Optional[str] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, MpvState]:
     """Launch mpv with IPC monitoring enabled and return exit code and final MpvState."""
     import os
@@ -193,10 +195,47 @@ def run_mpv_monitored(
     if start_time > 5.0:
         cmd.append(f"--start={int(start_time)}")
 
+    # Extract or infer headers and referrer
+    req_referer = referer or getattr(url, "referer", None) or (headers.get("Referer") if headers else None)
+    req_ua = (headers.get("User-Agent") if headers else None) or getattr(url, "headers", {}).get("User-Agent")
+
+    # Detect VidTube specifically (requires specific referer and a real browser UA to prevent 403 / TLS drops)
+    is_vidtube = any(k in str(url).lower() for k in ["cdn-video", "serv-stream", "vidtube"]) or \
+                 bool(req_referer and any(k in req_referer.lower() for k in ["vidtube", "cdn-video"]))
+
+    # Detect UpDown specifically (gamescdn.online requires Referer: https://updown.cam/ to prevent 403 Forbidden)
+    is_updown = any(k in str(url).lower() for k in ["gamescdn", "updown"]) or \
+                bool(req_referer and "updown" in req_referer.lower())
+
+    # Detect Uqload specifically
+    is_uqload = "uqload" in str(url).lower() or bool(req_referer and "uqload" in req_referer.lower())
+
+    if is_vidtube:
+        if not req_referer or not any(k in req_referer.lower() for k in ["vidtube", "down.vidtube.one"]):
+            req_referer = "https://down.vidtube.one/"
+        if not req_ua:
+            req_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    elif is_updown:
+        if not req_referer or "updown" not in req_referer.lower():
+            req_referer = "https://updown.cam/"
+        if not req_ua:
+            req_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    elif is_uqload:
+        if not req_referer:
+            req_referer = "https://uqload.net/"
+        if not req_ua:
+            req_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+    if req_referer:
+        cmd.append(f"--referrer={req_referer}")
+
+    if req_ua:
+        cmd.append(f"--user-agent={req_ua}")
+
     if extra_args:
         cmd.extend(extra_args)
 
-    cmd.append(url)
+    cmd.append(str(url))
 
     watcher = MpvWatcher(sock_path, poll_interval=0.3)
     watcher.start()

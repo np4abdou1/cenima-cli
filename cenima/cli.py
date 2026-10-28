@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import asyncio
 import time
-import threading
 import platform
 import urllib.request
 from pathlib import Path
@@ -27,6 +26,10 @@ from .scraper import TopCinemaScraper, clean_show_title
 from .history import HistoryManager
 from .models import WatchStatus
 from .mpv import run_mpv_monitored
+from .picker import RichPicker, CustomPrompt
+from .accent import get_auto_theme
+from .health import ServerHealthChecker, LIVE, SLOW, OFFLINE
+from .processor import ServerProcessor
 
 scraper = TopCinemaScraper()
 from .config import (
@@ -140,7 +143,9 @@ class Config:
         }
     
     def get_theme(self) -> Dict:
-        return THEMES.get(self.theme, THEMES[DEFAULT_THEME])
+        if self.theme == "auto":
+            return get_auto_theme()
+        return THEMES.get(self.theme, get_auto_theme())
 
 
 class CinemaCLI:
@@ -194,10 +199,24 @@ class CinemaCLI:
         info_text.append("  │\n", style=theme["accent"])
         info_text.append("╰────────────────────╯\n", style=theme["accent"])
         info_text.append("\n")
+        # Calculate stats
+        history_items = self.history.get_recent_history(limit=5000)
+        watched_eps = sum(1 for i in history_items if i.episode_number and (i.status == WatchStatus.COMPLETED or i.progress_pct >= 85.0))
+        watched_movies = sum(1 for i in history_items if i.content_type == "movie" and (i.status == WatchStatus.COMPLETED or i.progress_pct >= 85.0))
+        total_watch_time = sum(i.time_pos for i in history_items)
+        hours = int(total_watch_time // 3600)
         
-        info_text.append("👤 ", style=theme['accent'])
-        info_text.append("Author    ", style=f"bold {theme['secondary']}")
-        info_text.append(f"│ {__author__}\n")
+        info_text.append("🎬 ", style=theme['accent'])
+        info_text.append("Movies    ", style=f"bold {theme['secondary']}")
+        info_text.append(f"│ {watched_movies} Watched\n")
+        
+        info_text.append("📺 ", style=theme['accent'])
+        info_text.append("Episodes  ", style=f"bold {theme['secondary']}")
+        info_text.append(f"│ {watched_eps} Watched\n")
+        
+        info_text.append("⏱️  ", style=theme['accent'])
+        info_text.append("Time Wasted", style=f"bold {theme['secondary']}")
+        info_text.append(f"│ {hours} hours\n")
         
         info_text.append("💻 ", style=theme['accent'])
         info_text.append("OS        ", style=f"bold {theme['secondary']}")
@@ -208,15 +227,12 @@ class CinemaCLI:
         
         info_text.append("🎨 ", style=theme['accent'])
         info_text.append("Theme     ", style=f"bold {theme['secondary']}")
-        info_text.append(f"│ {self.config.theme.title()}\n")
-        
-        shell = os.environ.get('SHELL', 'Unknown')
-        if '/' in shell:
-            shell = shell.split('/')[-1]
-        info_text.append("🐚 ", style=theme['accent'])
-        info_text.append("Shell     ", style=f"bold {theme['secondary']}")
-        info_text.append(f"│ {shell}\n")
-        
+        if self.config.theme == "auto":
+            source = theme.get("source", "System")
+            info_text.append(f"│ Auto ({source})\n")
+        else:
+            info_text.append(f"│ {self.config.theme.title()}\n")
+
 
         if self.github_stars is None:
             self.github_stars = get_github_stars()
@@ -230,23 +246,10 @@ class CinemaCLI:
         else:
             info_text.append("0", style="#daa520")
             info_text.append(" (Star us!)\n", style="dim")
-        
-        info_text.append("🔗 ", style=theme['accent'])
-        info_text.append("Repository", style=f"bold {theme['secondary']}")
-        info_text.append("\n   ", style="")
-        # Make URL clickable in supported terminals, show a shorter display text
-        short_repo = GITHUB_REPO_URL.replace("https://", "").replace("http://", "")
-        # Use from_markup to properly parse the link markup
-        link_text = Text.from_markup(f"[link={GITHUB_REPO_URL}]{short_repo}[/link]", style=f"italic {theme['accent']}")
-        info_text.append_text(link_text)
         info_text.append("\n")
-
-
-        
-        info_text.append("\n")
-        info_text.append("💡 Type ", style="dim")
-        info_text.append("/help", style=f"bold {theme['accent']}")
-        info_text.append(" for commands", style="dim")
+        info_text.append("💡 Global Shortcuts\n", style=f"bold {theme['primary']}")
+        info_text.append("   b/Esc: Back    q/exit: Quit\n", style="dim")
+        info_text.append("   h/history: History     c/theme: Settings\n", style="dim")
         
         grid.add_row(art, info_text)
         
@@ -285,47 +288,89 @@ class CinemaCLI:
         title: Optional[str] = None,
         subtitle: Optional[str] = None
     ) -> Optional[int]:
-        numbered = [f"{i}\t{items[i]}" for i in range(len(items))]
-        input_str = "\n".join(numbered)
-        
-        self._show_picker_intro(title, subtitle)
-        
-        theme = self.theme
-        args = [
-            'fzf', '--ansi', '--layout=reverse', '--height=80%',
-            f'--prompt={prompt}',
-            '--delimiter=\t', '--with-nth=2',
-            f'--color=fg:-1,bg:-1,hl:{theme["accent"]},fg+:-1,bg+:-1,hl+:{theme["primary"]}',
-            f'--color=info:{theme["secondary"]},prompt:{theme["primary"]},pointer:{theme["primary"]}',
-            f'--color=marker:{theme["accent"]},spinner:{theme["primary"]},header:{theme["secondary"]}'
-        ]
-        if header:
-            args.append(f'--header={header}')
-        
-        try:
-            process = subprocess.run(args, input=input_str, capture_output=True, text=True)
-            CONSOLE.clear()
-            
-            if process.returncode == 0:
-                selected = process.stdout.strip()
-                if not selected:
+        if not items:
+            return None
+
+        # 1. Native fzf subprocess with ANSI color support
+        if shutil.which("fzf"):
+            try:
+                cmd = [
+                    "fzf",
+                    "--height=15",
+                    "--layout=reverse",
+                    "--border",
+                    "--prompt=" + prompt,
+                    "--pointer=❯",
+                    "--info=inline",
+                    "--ansi"
+                ]
+                
+                def to_plain(text_str: str) -> str:
+                    try:
+                        return Text.from_markup(text_str).plain
+                    except Exception:
+                        return str(text_str)
+
+                def to_ansi(text_str: str) -> str:
+                    try:
+                        temp_c = Console(force_terminal=True, color_system="truecolor")
+                        with temp_c.capture() as capture:
+                            temp_c.print(Text.from_markup(text_str), end="")
+                        return capture.get()
+                    except Exception:
+                        return to_plain(text_str)
+
+                header_parts = []
+                if title:
+                    header_parts.append(to_plain(title))
+                if subtitle:
+                    header_parts.append(to_plain(subtitle))
+                if header:
+                    header_parts.append(to_plain(header))
+
+                if header_parts:
+                    cmd.append(f"--header={' · '.join(header_parts)}")
+
+                # Convert Rich items to ANSI escape sequences for fzf
+                ansi_items = [to_ansi(str(item)) for item in items]
+                input_data = "\n".join([f"{i+1}. {item}" for i, item in enumerate(ansi_items)])
+                
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=None,  # fzf renders TUI on stderr!
+                    text=True
+                )
+                out, _ = proc.communicate(input=input_data)
+                
+                if proc.returncode == 0 and out.strip():
+                    selected_line = out.strip()
+                    match = re.match(r"^(\d+)\.", selected_line)
+                    if match:
+                        idx = int(match.group(1)) - 1
+                        if 0 <= idx < len(items):
+                            return idx
+                elif proc.returncode == 130:
+                    # User pressed ESC or Ctrl+C to cancel
                     return None
-                parts = selected.split('\t', 1)
-                try:
-                    idx = int(parts[0])
-                    if 0 <= idx < len(items):
-                        return idx
-                except ValueError:
-                    pass
-                return None
+            except Exception:
+                pass
+
+        # 2. Fallback to RichPicker if fzf is absent or fails
+        picker = RichPicker(CONSOLE, self.theme)
+        display_title = title or ""
+        if subtitle:
+            display_title += f"\n[dim]{subtitle}[/dim]"
+        if header:
+            display_title += f"\n[bold]{header}[/bold]"
             
-            if process.returncode in (130, 1):
-                return None
-            
-            return None
-        except Exception:
-            return None
-    
+        return picker.pick(
+            items, 
+            format_func=lambda x: str(x), 
+            title=display_title
+        )
+
     def run_fzf_objects(
         self,
         items: List[Any],
@@ -337,11 +382,16 @@ class CinemaCLI:
     ) -> Optional[Any]:
         if not items:
             return None
-        
-        choices = [format_func(i) for i in items]
-        idx = self.run_fzf(choices, prompt, header=header, title=title, subtitle=subtitle)
-        
-        if idx is not None:
+
+        formatted_items = [format_func(item) for item in items]
+        idx = self.run_fzf(
+            formatted_items,
+            prompt=prompt,
+            header=header,
+            title=title,
+            subtitle=subtitle
+        )
+        if idx is not None and 0 <= idx < len(items):
             return items[idx]
         return None
     
@@ -361,6 +411,8 @@ class CinemaCLI:
             CONSOLE.print(f"[bold]cenima-cli[/bold] v{__version__}")
             CONSOLE.print(f"[dim]Author: {__author__} • License: {__license__}[/dim]")
             input("\nPress Enter to continue...")
+            return True
+        elif cmd == "/back":
             return True
         
         return False
@@ -391,11 +443,11 @@ class CinemaCLI:
             if item.duration > 0:
                 pos_fmt = format_seconds(item.time_pos)
                 dur_fmt = format_seconds(item.duration)
-                prog_str = f" \033[33m[{int(item.progress_pct)}% · {pos_fmt}/{dur_fmt}]\033[0m"
+                prog_str = f" [yellow][{int(item.progress_pct)}% · {pos_fmt}/{dur_fmt}][/]"
             elif item.status == WatchStatus.COMPLETED:
-                prog_str = " \033[32m[Watched]\033[0m"
+                prog_str = " [green][Watched][/]"
             
-            return f"{badge} \033[1m{title}\033[0m{detail}{prog_str}"
+            return f"{badge} [b]{title}[/]{detail}{prog_str}"
 
         header = f"📊 {len(history_items)} items in history"
         selected = self.run_fzf_objects(
@@ -441,9 +493,13 @@ class CinemaCLI:
         theme_names = list(THEMES.keys())
         
         def fmt_theme(name):
+            if name == "auto":
+                auto_theme = get_auto_theme()
+                indicator = " ★" if name == self.config.theme else ""
+                return f"[{auto_theme['primary']}]● Auto Detect ({auto_theme['source']}){indicator}[/]"
             colors = THEMES[name]
             indicator = " ★" if name == self.config.theme else ""
-            return f"\033[38;2;{self._hex_to_rgb(colors['primary'])}m● {name.title()}{indicator}\033[0m"
+            return f"[{colors['primary']}]● {name.title()}{indicator}[/]"
         
         idx = self.run_fzf(
             [fmt_theme(t) for t in theme_names],
@@ -473,16 +529,14 @@ class CinemaCLI:
         CONSOLE.print("[dim]/help    - Show this help[/dim]")
         CONSOLE.print("[dim]/version - Show version info[/dim]")
         CONSOLE.print("[dim]exit     - Quit the application[/dim]")
-
-        CONSOLE.print("[dim]/theme   - Change color theme[/dim]")
-        CONSOLE.print("[dim]/help    - Show this help[/dim]")
-        CONSOLE.print("[dim]/version - Show version info[/dim]")
-        CONSOLE.print("[dim]exit     - Quit the application[/dim]")
         CONSOLE.print("")
         CONSOLE.print(f"[bold {theme['primary']}]🎮 Controls[/bold {theme['primary']}]")
-        CONSOLE.print("[dim]↑/↓      - Navigate lists[/dim]")
-        CONSOLE.print("[dim]Enter    - Select item[/dim]")
-        CONSOLE.print("[dim]Esc      - Go back[/dim]")
+        CONSOLE.print("[dim]↑/↓ (j/k) - Navigate item lists[/dim]")
+        CONSOLE.print("[dim]/         - Live filter list items[/dim]")
+        CONSOLE.print("[dim]PgUp/PgDn - Page scroll up / down[/dim]")
+        CONSOLE.print("[dim]Home/End  - Jump to top / bottom[/dim]")
+        CONSOLE.print("[dim]Enter     - Select item[/dim]")
+        CONSOLE.print("[dim]Esc (b)   - Go back / Clear filter[/dim]")
         CONSOLE.print("[dim]Type     - Filter results[/dim]")
         CONSOLE.print("")
         input("Press Enter to continue...")
@@ -492,12 +546,20 @@ class CinemaCLI:
             self.banner()
             theme = self.theme
             
-            CONSOLE.print(f"[{theme['accent']}]╭[/{theme['accent']}]" + f"[{theme['accent']}]─[/{theme['accent']}]" * 15 + f"[{theme['accent']}] 🔍 Search [/{theme['accent']}]" + f"[{theme['accent']}]─[/{theme['accent']}]" * 15 + f"[{theme['accent']}]╮[/{theme['accent']}]")
+            CONSOLE.print(f"[{theme['primary']}]🔍 Search [dim]• movies • series • anime[/dim][/{theme['primary']}]")
+            custom_prompt = CustomPrompt(CONSOLE, theme)
             
-            CONSOLE.print(f"[{theme['accent']}]│[/{theme['accent']}]", end="")
-            query = Prompt.ask(f"[{theme['primary']}]❯[/{theme['primary']}]", console=CONSOLE)
+            if not hasattr(self, 'search_history'):
+                self.search_history = []
+                
+            query = custom_prompt.ask(f"[{theme['accent']}]❯[/{theme['accent']}]", history=self.search_history)
             
-            CONSOLE.print(f"[{theme['accent']}]╰[/{theme['accent']}]" + f"[dim {theme['accent']}]─ movies • series • anime ─[/dim {theme['accent']}]" + f"[{theme['accent']}]╯[/{theme['accent']}]")
+            if not query:
+                continue
+                
+            if not query.startswith('/'):
+                if not self.search_history or self.search_history[-1] != query:
+                    self.search_history.append(query)
             
             if query.lower() in ('exit', 'quit', '/exit', '/quit'):
                 self.goodbye()
@@ -531,13 +593,15 @@ class CinemaCLI:
             def get_relevance_score(result, search_query):
                 title = clean_show_title(result['title']).lower()
                 query_lower = search_query.lower()
+                norm_title = re.sub(r'[^a-z0-9]+', ' ', title).strip()
+                norm_query = re.sub(r'[^a-z0-9]+', ' ', query_lower).strip()
                 rating = result.get('metadata', {}).get('rating') or result.get('metadata', {}).get('imdb_rating') or 0
                 
-                if title == query_lower:
+                if norm_title == norm_query or title == query_lower:
                     return (0, -rating)
-                elif title.startswith(query_lower):
+                elif norm_title.startswith(norm_query) or title.startswith(query_lower):
                     return (1, -rating)
-                elif query_lower in title:
+                elif norm_query in norm_title or query_lower in title:
                     return (2, -rating)
                 else:
                     return (3, -rating)
@@ -546,30 +610,30 @@ class CinemaCLI:
             
             def fmt_res(r):
                 type_emoji = "🎬" if r['type'] == 'movie' else "📺" if r['type'] == 'series' else "🎌"
-                type_color = "34" if r['type'] == 'movie' else "35" if r['type'] == 'series' else "36"
+                type_color = "blue" if r['type'] == 'movie' else "magenta" if r['type'] == 'series' else "cyan"
                 clean_t = clean_show_title(r['title'])
                 
                 year = r.get('metadata', {}).get('year')
                 year_str = f" ({year})" if year and str(year).lower() != 'n/a' else ""
                 
                 rating = r.get('metadata', {}).get('rating') or r.get('metadata', {}).get('imdb_rating')
-                rating_str = f" \033[38;2;218;165;32m★{rating}\033[0m" if rating else ""
+                rating_str = f" [gold1]★{rating}[/]" if rating else ""
                 
                 quality = r.get('metadata', {}).get('quality')
                 quality_str = ""
                 if quality:
                     q_upper = quality.upper()
                     if 'CAM' in q_upper:
-                        q_color = "31"
+                        q_color = "red"
                     elif 'BLURAY' in q_upper:
-                        q_color = "36"
+                        q_color = "cyan"
                     elif 'WEB' in q_upper:
-                        q_color = "32"
+                        q_color = "green"
                     else:
-                        q_color = "37"
-                    quality_str = f" \033[{q_color}m[{quality}]\033[0m"
+                        q_color = "white"
+                    quality_str = f" [{q_color}][{quality}][/]"
                 
-                return f"{type_emoji} \033[{type_color}m{r['type'].title().ljust(8)}\033[0m│ {clean_t}{year_str}{rating_str}{quality_str}"
+                return f"{type_emoji} [{type_color}]{r['type'].title().ljust(8)}[/]│ {clean_t}{year_str}{rating_str}{quality_str}"
             
             results_count = len(results)
             result_header = f"📊 {results_count} {'match' if results_count == 1 else 'matches'}"
@@ -647,18 +711,34 @@ class CinemaCLI:
         if not title:
             return ""
         t = title.strip()
+        # Clean quality, resolution, ratings, and common metadata tags
+        junk_patterns = [
+            r'\b(?:1080p|720p|480p|360p)\b',
+            r'\b(?:WEB-DL|BluRay|HDTV|CAM)\b',
+            r'\b(?:x264|x265|HEVC)\b',
+            r'\b\d+\.\d*\b',
+            r'\b\.\d+\b',
+            r'\b\d+\.\b',
+            r'[★⭐]\s*\d+\.?\d*',
+            r'\[\s*\d+\.?\d*\s*\]',
+            r'\b(?:Season|الموسم)\s*\d+',
+            r'\b(?:Episode|الحلقة)\s*\d+',
+        ]
+        for pat in junk_patterns:
+            t = re.sub(pat, '', t, flags=re.IGNORECASE)
         patterns = [
             rf'^(?:Episode\s+)?0*{re.escape(str(num_label))}\s*[\.\-:]\s*',
             r'^[\s\.\-:]*\d+\s*[\.\-:]\s*'
         ]
         for pat in patterns:
             t = re.sub(pat, '', t, flags=re.IGNORECASE)
-        return t.strip()
+        if hasattr(self, 'current_show_title') and self.current_show_title:
+            t = re.sub(re.escape(self.current_show_title), '', t, flags=re.IGNORECASE)
+        return t.strip(' .-_:')
     
     def _format_episode_label(self, episode):
         num_raw = episode.get('display_number') or episode.get('episode_number')
         num_label = self._normalize_episode_number(num_raw)
-        title = self._clean_episode_title(episode.get('title', ''), num_label)
         
         season_num = self.current_season.get('season_number') if self.current_season else None
         prog = self.history.get_progress(self.current_show_title, season_num, num_label)
@@ -668,14 +748,21 @@ class CinemaCLI:
         if prog:
             if prog.status == WatchStatus.COMPLETED or prog.progress_pct >= 85.0:
                 badge = "👁️ "
-                status_str = " \033[32m[Watched]\033[0m"
+                status_str = " [green][Watched][/]"
             elif prog.status == WatchStatus.IN_PROGRESS and prog.progress_pct > 0:
                 badge = "⏳"
                 pos_fmt = format_seconds(prog.time_pos)
-                status_str = f" \033[33m[{int(prog.progress_pct)}% · {pos_fmt}]\033[0m"
+                status_str = f" [yellow][{int(prog.progress_pct)}% · {pos_fmt}][/]"
         
-        title_str = f" · {title}" if title else ""
-        return f"{badge} Episode {num_label}{title_str}{status_str}"
+        # Display only episode number
+        if str(num_label).lower().startswith(("episode", "ep")):
+            ep_text = num_label
+        elif str(num_label).replace('.', '', 1).isdigit():
+            ep_text = f"Episode {num_label}"
+        else:
+            ep_text = str(num_label)
+            
+        return f"{badge} {ep_text}{status_str}"
     
     def _display_show_overview(self, details):
         title = clean_show_title(details.get("title", ""))
@@ -745,7 +832,7 @@ class CinemaCLI:
                 num = season.get('season_number', 1)
                 label = season.get('display_label') or f"Season {num}"
                 watched_cnt, _ = self.history.get_season_stats(self.current_show_title, num)
-                stats_str = f" \033[32m(👁️ {watched_cnt} watched)\033[0m" if watched_cnt > 0 else ""
+                stats_str = f" [green](👁️ {watched_cnt} watched)[/]" if watched_cnt > 0 else ""
                 return f"📂 {label}{stats_str}"
             
             season_header = f"📊 {season_count} seasons"
@@ -755,7 +842,7 @@ class CinemaCLI:
                 prompt="📂 Season ❯ ",
                 title=f"📺 {self.current_show_title}",
                 subtitle=season_header,
-                header=season_header
+                header=None
             )
             
             if not selected_season:
@@ -809,7 +896,7 @@ class CinemaCLI:
                 prompt="📺 Episode ❯ ",
                 title=f"📺 {self.current_show_title} — {season_label}",
                 subtitle=episode_header,
-                header=episode_header
+                header=None
             )
             
             if not selected_ep:
@@ -871,17 +958,106 @@ class CinemaCLI:
             self.log("✗", "No servers available", theme['error'])
             await asyncio.sleep(1)
             return
-        
-        selected_server = servers[0]
-        video_url = selected_server.get('video_url')
-        referer = selected_server.get('embed_url') or scraper.base_url
-        
-        if not video_url:
-            self.log("✗", "Failed to extract video URL", theme['error'])
-            await asyncio.sleep(1)
+
+        # Probe every server up-front so the picker can show which ones are
+        # actually streaming right now. Verdicts are cached per embed URL, so
+        # coming back to the same episode is instant.
+        primary_color = theme.get('primary', 'cyan')
+        checker = ServerHealthChecker(referer=scraper.base_url)
+        loop = asyncio.get_running_loop()
+
+        with Progress(
+            SpinnerColumn("dots2"),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(bar_width=25),
+            TextColumn(f"[bold {primary_color}]{{task.completed}}/{{task.total}}[/]"),
+            console=CONSOLE,
+            transient=True
+        ) as progress:
+            ptask = progress.add_task(f"[{primary_color}]Checking servers...", total=len(servers))
+
+            def advance():
+                # Called from the probe worker thread; progress lives on the loop.
+                loop.call_soon_threadsafe(progress.advance, ptask, 1)
+
+            servers = await asyncio.to_thread(checker.probe_all, servers, 16, advance)
+            # Let the queued progress callbacks drain while the bar still exists.
+            await asyncio.sleep(0)
+
+        total_servers = len(servers)
+        live_count = sum(1 for s in servers if s.get("health") == LIVE)
+        slow_count = sum(1 for s in servers if s.get("health") == SLOW)
+
+        if total_servers == 1 and live_count == 1:
+            # Nothing to choose between and we already know it works.
+            selected_server = servers[0]
+        else:
+            def fmt_server(s):
+                name = escape(str(s.get('name') or 'Server'))
+                health = s.get('health', OFFLINE)
+                if health == LIVE:
+                    return f"[green]🟢[/] [green]Online [/] {name}"
+                if health == SLOW:
+                    return f"[yellow]🟡[/] [yellow]Slow   [/] {name}"
+                return f"[red]🔴[/] [dim red]Offline[/] {name}"
+
+            summary = []
+            if live_count:
+                summary.append(f"🟢 {live_count}/{total_servers} online")
+            if slow_count:
+                summary.append(f"🟡 {slow_count} slow")
+            if not summary:
+                summary.append(f"⚠️  No server online ({total_servers} checked)")
+            subtitle = " · ".join(summary) + f" · {title_context}"
+
+            selected_server = self.run_fzf_objects(
+                servers,
+                fmt_server,
+                prompt="📡 Server ❯ ",
+                title="📡 Select Streaming Server",
+                subtitle=subtitle,
+                header=None
+            )
+        if not selected_server:
             return
         
-        self.log("▶️", "Launching player...")
+        video_url = selected_server.get('video_url')
+        srv_url = selected_server.get('embed_url') or scraper.base_url
+        
+        if not video_url:
+            name = selected_server.get('name', 'Server')
+            if selected_server.get('health') == OFFLINE:
+                self.log("⚠️", f"{name} was marked offline — retrying anyway...", f"bold {theme['error']}")
+            else:
+                self.log("🔄", f"Resolving {name}...")
+            with Progress(
+                SpinnerColumn("star"),
+                TextColumn("[progress.description]{task.description}"),
+                console=CONSOLE,
+                transient=True
+            ) as progress:
+                progress.add_task(f"[{primary_color}]Extracting stream...", total=None)
+                proc = ServerProcessor()
+                video_url = await asyncio.to_thread(proc.extract, srv_url, scraper.base_url)
+        
+        if not video_url:
+            self.log("✗", f"Server offline: {selected_server.get('name')}", theme['error'])
+            await asyncio.sleep(2)
+            return
+
+        # Determine the correct referer for mpv anti-hotlink headers
+        if hasattr(video_url, "referer") and video_url.referer:
+            referer = video_url.referer
+        elif any(k in str(video_url).lower() for k in ["cdn-video", "serv-stream", "vidtube"]):
+            referer = "https://down.vidtube.one/"
+        elif any(k in str(video_url).lower() for k in ["gamescdn", "updown"]):
+            referer = "https://updown.cam/"
+        elif "uqload" in str(video_url).lower():
+            referer = "https://uqload.net/"
+        else:
+            referer = srv_url
+        
+        self.log("▶️", f"Launching player with {selected_server.get('name')}...")
         await asyncio.sleep(0.3)
         
         self.play_video(
@@ -929,8 +1105,23 @@ class CinemaCLI:
             pass
     
     def _build_mpv_command(self, url, referer=None, title=None, sock=None):
-        """Build the mpv argv with 0 extra arguments: mpv <url>."""
-        return ["mpv", url]
+        cmd = ["mpv"]
+        if sock:
+            cmd.append(f"--input-ipc-server={sock}")
+        if title:
+            cmd.append(f"--title={title}")
+        req_referer = referer or getattr(url, "referer", None)
+        is_vidtube = any(k in str(url).lower() for k in ["cdn-video", "serv-stream", "vidtube"]) or \
+                     bool(req_referer and any(k in str(req_referer).lower() for k in ["vidtube", "cdn-video"]))
+        if is_vidtube:
+            if not req_referer or not any(k in str(req_referer).lower() for k in ["vidtube", "down.vidtube.one"]):
+                req_referer = "https://down.vidtube.one/"
+            cmd.append(f"--referrer={req_referer}")
+            cmd.append("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        elif req_referer:
+            cmd.append(f"--referrer={req_referer}")
+        cmd.append(str(url))
+        return cmd
 
     def play_video(
         self,
@@ -968,7 +1159,8 @@ class CinemaCLI:
         rc, mpv_state = run_mpv_monitored(
             url=url,
             title=title or self.current_show_title or "cenima-cli",
-            start_time=start_time
+            start_time=start_time,
+            referer=referer,
         )
 
         if mpv_state and mpv_state.time_pos and mpv_state.time_pos > 5:
