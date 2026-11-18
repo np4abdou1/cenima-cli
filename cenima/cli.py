@@ -31,8 +31,21 @@ from .accent import get_auto_theme
 from .health import ServerHealthChecker, LIVE, SLOW, OFFLINE
 from .processor import ServerProcessor
 
-scraper = TopCinemaScraper()
+class _LazyScraper:
+    def __init__(self):
+        self._instance = None
+
+    def _get_instance(self):
+        if self._instance is None:
+            self._instance = TopCinemaScraper()
+        return self._instance
+
+    def __getattr__(self, name):
+        return getattr(self._get_instance(), name)
+
+scraper = _LazyScraper()
 from .config import (
+
     __version__, __author__, __license__,
     CONFIG_DIR, CONFIG_FILE,
     ASCII_ART, GOODBYE_ART,
@@ -54,19 +67,21 @@ def format_seconds(secs: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def get_github_stars() -> int:
-
+def get_github_stars(allow_network: bool = True) -> int:
     cache_file = CONFIG_DIR / "stars_cache.json"
     cache_duration = 3600
     
     if cache_file.exists():
         try:
             data = json.loads(cache_file.read_text())
-            if time.time() - data.get('timestamp', 0) < cache_duration:
+            if not allow_network or (time.time() - data.get('timestamp', 0) < cache_duration):
                 return data.get('stars', 0)
         except Exception:
             pass
     
+    if not allow_network:
+        return 0
+
     try:
         req = urllib.request.Request(GITHUB_API_URL)
         req.add_header('Accept', 'application/vnd.github.v3+json')
@@ -158,8 +173,18 @@ class CinemaCLI:
         self.current_episodes = []
         self.current_episode_index = 0
         self.current_season = None
-        self.github_stars = None  # Lazy load
+        self.github_stars = get_github_stars(allow_network=False)
+        import threading
+        threading.Thread(target=self._refresh_stars_background, daemon=True).start()
         self.check_deps()
+
+    def _refresh_stars_background(self):
+        try:
+            stars = get_github_stars(allow_network=True)
+            if stars:
+                self.github_stars = stars
+        except Exception:
+            pass
 
     
     @property
@@ -235,7 +260,7 @@ class CinemaCLI:
 
 
         if self.github_stars is None:
-            self.github_stars = get_github_stars()
+            self.github_stars = get_github_stars(allow_network=False)
         
         info_text.append("⭐ ", style="#daa520")
         info_text.append("Stars     ", style=f"bold {theme['secondary']}")
@@ -959,10 +984,55 @@ class CinemaCLI:
             await asyncio.sleep(1)
             return
 
-        # Probe every server up-front so the picker can show which ones are
-        # actually streaming right now. Verdicts are cached per embed URL, so
-        # coming back to the same episode is instant.
         primary_color = theme.get('primary', 'cyan')
+
+        # Fast-track VidTube server directly (skip expensive multi-server health probing)
+        def is_vidtube_server(s):
+            url_str = str(s.get('embed_url') or '').lower()
+            name_str = str(s.get('name') or '').lower()
+            return any(k in url_str for k in ['vidtube', 'cdn-video', 'serv-stream']) or 'videotube' in name_str
+
+        vidtube_server = next((s for s in servers if is_vidtube_server(s)), None)
+        if vidtube_server:
+            selected_server = vidtube_server
+            video_url = selected_server.get('video_url')
+            srv_url = selected_server.get('embed_url') or scraper.base_url
+
+            if not video_url:
+                with Progress(
+                    SpinnerColumn("star"),
+                    TextColumn("[progress.description]{task.description}"),
+                    console=CONSOLE,
+                    transient=True
+                ) as progress:
+                    progress.add_task(f"[{primary_color}]Resolving VidTube stream...", total=None)
+                    proc = ServerProcessor()
+                    video_url = await asyncio.to_thread(proc.extract, srv_url, scraper.base_url)
+
+            if video_url:
+                if hasattr(video_url, "referer") and video_url.referer:
+                    referer = video_url.referer
+                else:
+                    referer = "https://down.vidtube.one/"
+
+                self.log("▶️", f"Launching player with {selected_server.get('name')}...")
+                await asyncio.sleep(0.1)
+
+                self.play_video(
+                    video_url,
+                    referer=referer,
+                    title=title_context,
+                    season_num=season_num,
+                    ep_num=ep_num,
+                    ep_title=ep_title,
+                    content_type="series" if is_episode else "movie"
+                )
+
+                if is_episode and self.current_episodes:
+                    await self.prompt_next_episode()
+                return
+
+        # Fallback: probe servers if VidTube is unavailable or extraction failed
         checker = ServerHealthChecker(referer=scraper.base_url)
         loop = asyncio.get_running_loop()
 

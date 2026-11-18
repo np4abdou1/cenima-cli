@@ -15,7 +15,10 @@ import json
 import socket
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+import http.server
+import socketserver
+
 
 
 class MpvIpcError(Exception):
@@ -106,24 +109,88 @@ class MpvState:
         self.audio_channels: Optional[int] = None
 
 
-# mpv property name -> MpvState attribute
+# mpv property name -> MpvState attribute (only poll what history tracking requires)
 PROPERTY_MAP: Dict[str, str] = {
     "time-pos": "time_pos",
     "duration": "duration",
     "pause": "paused",
-    "cache-buffering-state": "buffering",
-    "demuxer-cache-duration": "cache_duration",
-    "video-format": "video_format",
-    "video-codec": "video_codec",
-    "video-params/width": "width",
-    "video-params/height": "height",
-    "video-params/fps": "video_fps",
-    "container-fps": "container_fps",
-    "display-fps": "display_fps",
-    "audio-codec": "audio_codec",
-    "audio-params/samplerate": "audio_samplerate",
-    "audio-params/channels": "audio_channels",
 }
+
+
+class _ThreadedProxyServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class StreamProxy:
+    """Lightweight local HTTP streaming proxy that proxies stream requests
+    using curl_cffi with chrome120 impersonation. This bypasses anti-bot TLS
+    fingerprinting (JA3/JA4) enforced by video CDNs (such as VidTube's
+    serv-stream-cdn*.cdn-video.xyz) which terminate standard OpenSSL / FFmpeg
+    connections mid-stream with 'corrupted CTTS atom' / EOF.
+    """
+
+    def __init__(self, target_url: str, referer: str = "", user_agent: str = ""):
+        self.target_url = str(target_url)
+        self.referer = referer or ""
+        self.user_agent = user_agent or "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        self._server: Optional[_ThreadedProxyServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self.port: int = 0
+        self.stream_url: str = ""
+
+    def start(self) -> str:
+        from curl_cffi import requests
+        target_url = self.target_url
+        referer = self.referer
+        user_agent = self.user_agent
+
+        class ProxyHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                session = requests.Session(impersonate="chrome120")
+                req_headers = {
+                    "User-Agent": user_agent,
+                }
+                if referer:
+                    req_headers["Referer"] = referer
+                if "Range" in self.headers:
+                    req_headers["Range"] = self.headers["Range"]
+
+                try:
+                    resp = session.get(target_url, headers=req_headers, stream=True, timeout=15)
+                    self.send_response(resp.status_code)
+                    for h in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"]:
+                        val = resp.headers.get(h)
+                        if val:
+                            self.send_header(h, val)
+                    self.end_headers()
+
+                    for chunk in resp.iter_content(chunk_size=128 * 1024):
+                        try:
+                            self.wfile.write(chunk)
+                        except (BrokenPipeError, ConnectionResetError):
+                            break
+                except Exception:
+                    pass
+
+            def log_message(self, format, *args):
+                pass
+
+        self._server = _ThreadedProxyServer(("127.0.0.1", 0), ProxyHandler)
+        self.port = self._server.server_address[1]
+        self.stream_url = f"http://127.0.0.1:{self.port}/stream.mp4"
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return self.stream_url
+
+    def stop(self) -> None:
+        if self._server:
+            try:
+                self._server.shutdown()
+                self._server.server_close()
+            except Exception:
+                pass
+
 
 
 class MpvWatcher(threading.Thread):
@@ -226,18 +293,26 @@ def run_mpv_monitored(
         if not req_ua:
             req_ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    if req_referer:
-        cmd.append(f"--referrer={req_referer}")
-
-    if req_ua:
-        cmd.append(f"--user-agent={req_ua}")
-
     if extra_args:
         cmd.extend(extra_args)
 
-    cmd.append(str(url))
+    # Fast start optimizations: skip external yt-dlp probing on direct streams
+    cmd.append("--ytdl=no")
 
-    watcher = MpvWatcher(sock_path, poll_interval=0.3)
+    # VidTube servers enforce TLS browser fingerprint checks; route through local StreamProxy
+    proxy = None
+    if is_vidtube:
+        proxy = StreamProxy(target_url=str(url), referer=req_referer, user_agent=req_ua)
+        play_url = proxy.start()
+        cmd.append(play_url)
+    else:
+        if req_referer:
+            cmd.append(f"--referrer={req_referer}")
+        if req_ua:
+            cmd.append(f"--user-agent={req_ua}")
+        cmd.append(str(url))
+
+    watcher = MpvWatcher(sock_path, poll_interval=0.5)
     watcher.start()
 
     try:
@@ -249,6 +324,8 @@ def run_mpv_monitored(
         rc = 1
     finally:
         watcher.stop()
+        if proxy:
+            proxy.stop()
         if os.path.exists(sock_path):
             try:
                 os.remove(sock_path)

@@ -228,17 +228,11 @@ class TopCinemaScraper:
             try:
                 cache_data = json.loads(DOMAIN_CACHE_FILE.read_text())
                 cached_url = cache_data.get("domain")
-                # Quick verification probe to check for 301/302 redirect on the cached domain
-                if cached_url:
-                    resp = self.session.get(cached_url, timeout=4, allow_redirects=True)
-                    if resp.status_code == 200:
-                        parsed = urlparse(resp.url)
-                        if "topcinema" in parsed.netloc.lower():
-                            resolved = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
-                            self._set_active_domain(resolved)
-                            if resolved != cached_url:
-                                self._save_domain_cache(resolved)
-                            return self.base_url
+                # Trust cached domain for 7 days without blocking startup network probe.
+                # Redirects on live requests will auto-update the domain anyway.
+                if cached_url and time.time() - cache_data.get("timestamp", 0) < 86400 * 7:
+                    self._set_active_domain(cached_url)
+                    return self.base_url
             except Exception:
                 pass
 

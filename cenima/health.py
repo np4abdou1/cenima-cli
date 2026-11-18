@@ -28,6 +28,7 @@ OFFLINE = "offline"
 DEAD_HOST_MARKERS = (
     "bowfile", "1cloudfile", "nitroflare", "1fichier",
     "rapidgator", "ddownload", "mdiaload", "cloudfile",
+    "salabox", "linkbox",
 )
 
 PLAYABLE_STATUS = (200, 206)
