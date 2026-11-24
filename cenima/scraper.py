@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-import re
 import json
-import os
+import logging
+import re
 import time
 from curl_cffi import requests
 from typing import List, Dict, Optional, Any
-from urllib.parse import quote, urlparse, unquote
+from urllib.parse import quote, urlparse, unquote, urljoin
 from bs4 import BeautifulSoup
 
 from .config import (
     BASE_URL, MIRROR_DOMAINS, DOMAIN_CACHE_FILE, CONFIG_DIR,
     HEADERS, AJAX_HEADERS,
-    REQUEST_TIMEOUT, RETRY_TOTAL, RETRY_BACKOFF, RETRY_STATUS_CODES
+    REQUEST_TIMEOUT,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def clean_text(text: str) -> str:
@@ -94,8 +96,6 @@ def parse_episode_number(ep_str: str) -> float:
     return 99999.0
 
 def extract_season_number(text: str) -> int:
-    from urllib.parse import unquote
-    
     # URL decode first (handles %d9%85 etc.)
     text = unquote(text)
     text_lower = text.lower()
@@ -148,8 +148,7 @@ def extract_season_number(text: str) -> int:
     return 1
 
 def extract_season_part(text: str) -> Optional[str]:
-    from urllib.parse import unquote
-    text = unquote(text).lower()
+    text = unquote(text).lower().replace('-', ' ').replace('_', ' ')
     
     part_match = re.search(r'(?:part|الجزء|جزء)[- ]?(\d+)|p(\d+)', text, re.IGNORECASE)
     if part_match:
@@ -158,7 +157,7 @@ def extract_season_part(text: str) -> Optional[str]:
     
     if 'الجزء الثاني' in text or 'part 2' in text or 'cour 2' in text:
         return "Part 2"
-    elif 'الجزء الاول' in text or 'part 1' in text or 'cour 1' in text:
+    elif 'الجزء الاول' in text or 'الجزء الأول' in text or 'part 1' in text or 'cour 1' in text:
         return "Part 1"
     
     return None
@@ -296,8 +295,8 @@ class TopCinemaScraper:
                             continue
                         seen_urls.add(result["url"])
                         results.append(result)
-        except Exception as e:
-            pass
+        except Exception as exc:
+            logger.debug("AJAX search failed for %r: %s", query, exc)
 
         # Method 2: Fallback GET search page if AJAX returns no results
         if not results:
@@ -321,8 +320,8 @@ class TopCinemaScraper:
                                 continue
                             seen_urls.add(result["url"])
                             results.append(result)
-            except Exception as e:
-                pass
+            except Exception as exc:
+                logger.debug("Fallback GET search failed for %r: %s", query, exc)
 
         return self._deduplicate_search_results(results)
 
@@ -437,7 +436,7 @@ class TopCinemaScraper:
             }
         
         except Exception as e:
-            print(f"[WARN] Failed to parse search result: {e}")
+            logger.warning("Failed to parse search result: %s", e)
             return None
     
     def get_show_details(self, url: str) -> Optional[Dict]:
@@ -456,7 +455,7 @@ class TopCinemaScraper:
                 return self.get_movie_details(url)
         
         except Exception as e:
-            print(f"[ERROR] Failed to get show details: {e}")
+            logger.error("Failed to get show details for %s: %s", url, e)
             return None
     
     def get_movie_details(self, url: str) -> Optional[Dict]:
@@ -500,7 +499,7 @@ class TopCinemaScraper:
             return details
         
         except Exception as e:
-            print(f"[ERROR] Failed to get movie details: {e}")
+            logger.error("Failed to get movie details for %s: %s", url, e)
             return None
     
     def get_series_details(self, url: str, show_type: str = "series") -> Optional[Dict]:
@@ -534,7 +533,7 @@ class TopCinemaScraper:
                     text = link.get_text().lower()
                     title = link.get("title", "").lower()
                     
-                    if (("/ series/" in href or "/anime/" in href) and 
+                    if (("/series/" in href or "/anime/" in href) and 
                         ("الموسم" in href or "season" in href or 
                          "season" in text or "الموسم" in title)):
                         if href not in seen_urls:
@@ -575,9 +574,7 @@ class TopCinemaScraper:
             return details
         
         except Exception as e:
-            print(f"[ERROR] Failed to get series details: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Failed to get series details for %s: %s", url, e)
             return None
     
     def _parse_metadata(self, soup: BeautifulSoup, url: str) -> Dict:
@@ -712,6 +709,7 @@ class TopCinemaScraper:
 
             # Collect all episodes from all pages
             all_episodes = []
+            poster = None
             seen_urls = set()
             page = 1
             max_pages = 50  # Safety limit
@@ -744,6 +742,11 @@ class TopCinemaScraper:
                     response.raise_for_status()
                     
                     soup = BeautifulSoup(response.text, "html.parser")
+                    
+                    if page == 1 and poster is None:
+                        poster_img = soup.find("img", class_=re.compile("poster"))
+                        if poster_img:
+                            poster = poster_img.get("data-src") or poster_img.get("src")
                     
                     # Find episode links - Method 1: Look for .allepcont .row > a
                     episode_anchors = soup.select(".allepcont .row > a")
@@ -822,14 +825,16 @@ class TopCinemaScraper:
             # Sort episodes by number
             all_episodes.sort(key=lambda e: parse_episode_number(e.get("episode_number", "")))
             
-            # Get poster from first page
-            response = self.session.get(base_url + '/', timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            self._handle_response_redirect(response)
-            soup = BeautifulSoup(response.text, "html.parser")
-            poster = None
-            poster_img = soup.find("img", class_=re.compile("poster"))
-            if poster_img:
-                poster = poster_img.get("data-src") or poster_img.get("src")
+            if poster is None:
+                try:
+                    response = self.session.get(base_url + '/', timeout=REQUEST_TIMEOUT, allow_redirects=True)
+                    self._handle_response_redirect(response)
+                    soup = BeautifulSoup(response.text, "html.parser")
+                    poster_img = soup.find("img", class_=re.compile("poster"))
+                    if poster_img:
+                        poster = poster_img.get("data-src") or poster_img.get("src")
+                except Exception as exc:
+                    logger.debug("Failed to fetch season poster for %s: %s", base_url, exc)
             
             return {
                 "season_number": season_num,
@@ -838,9 +843,7 @@ class TopCinemaScraper:
             }
         
         except Exception as e:
-            print(f"[WARN] Failed to parse season: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.warning("Failed to parse season %s: %s", season_url, e)
             return None
     
     def _parse_episode_link(self, link_elem, url: str) -> Optional[Dict]:
@@ -933,17 +936,6 @@ class TopCinemaScraper:
     
     # --- Servers ---
     
-    def _extract_vidtube_url(self, embed_url: str, referer: Optional[str] = None) -> Optional[str]:
-        """Extract actual video URL from embed page using Python VidTubeProcessor."""
-        vidtube_domains = ['vidtube.one', 'vidtube.pro', 'vidtube.me', 'vidtube.to']
-        if not any(domain in embed_url.lower() for domain in vidtube_domains):
-            return None
-            
-        try:
-             return self.vidtube_processor.extract(embed_url, referer=referer or self.base_url)
-        except Exception as e:
-            return None
-
     def get_servers(self, content_id: str, referer: str, max_servers: int = 10) -> List[Dict]:
         servers = []
         seen_urls = set()

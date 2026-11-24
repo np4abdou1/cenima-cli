@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .config import CONFIG_DIR, HISTORY_FILE, COMPLETED_THRESHOLD
+from .config import COMPLETED_THRESHOLD, HISTORY_FILE
 from .models import WatchProgress, WatchStatus
+
+logger = logging.getLogger(__name__)
 
 
 class HistoryManager:
@@ -49,19 +53,27 @@ class HistoryManager:
                         self._history = {}
                 else:
                     self._history = {}
-            except Exception:
+            except Exception as exc:
+                logger.warning("Failed to load watch history from %s: %s", self.history_file, exc)
                 self._history = {}
 
     def save(self) -> None:
         with self._lock:
+            tmp_file = self.history_file.with_suffix(self.history_file.suffix + ".tmp")
             try:
-                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-                self.history_file.write_text(
+                self.history_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp_file.write_text(
                     json.dumps(self._history, indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
-            except Exception:
-                pass
+                os.replace(tmp_file, self.history_file)
+            except Exception as exc:
+                logger.warning("Failed to save watch history to %s: %s", self.history_file, exc)
+                try:
+                    if tmp_file.exists():
+                        tmp_file.unlink()
+                except OSError:
+                    pass
 
     def get_progress(
         self,
@@ -75,8 +87,8 @@ class HistoryManager:
             if data:
                 try:
                     return WatchProgress(**data)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Skipping invalid history entry %s: %s", key, exc)
         return None
 
     def update_progress(
@@ -170,8 +182,8 @@ class HistoryManager:
             for key, data in self._history.items():
                 try:
                     items.append(WatchProgress(**data))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Skipping invalid history entry %s: %s", key, exc)
         items.sort(key=lambda x: x.last_watched, reverse=True)
         return items[:limit]
 

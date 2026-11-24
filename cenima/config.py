@@ -42,9 +42,6 @@ AJAX_HEADERS = {
 }
 
 REQUEST_TIMEOUT = 15
-RETRY_TOTAL = 3
-RETRY_BACKOFF = 0.5
-RETRY_STATUS_CODES = [429, 500, 502, 503, 504]
 
 # --- ASCII Art ---
 ASCII_ART = r"""
@@ -73,11 +70,9 @@ GOODBYE_ART = r"""
       |__/       
 """
 
-from .accent import get_auto_theme, detect_system_accent
-
 # --- Theme Definitions ---
 THEMES = {
-    "auto": get_auto_theme(),
+    "auto": None,
     "blue": {"primary": "#7eb3d4", "secondary": "#9ac9e3", "accent": "#5a9bc7", "error": "#d97979"},
     "red": {"primary": "#d97979", "secondary": "#e59393", "accent": "#c55a5a", "error": "#d97979"},
     "green": {"primary": "#8ba87f", "secondary": "#a3ba98", "accent": "#6d8a62", "error": "#d97979"},
@@ -98,6 +93,3 @@ THEMES = {
 }
 
 DEFAULT_THEME = "auto"
-
-# --- Spinners ---
-SPINNERS = ["dots", "dots2", "dots3", "line", "star", "growVertical", "arc", "bouncingBar", "aesthetic"]

@@ -3,24 +3,19 @@ import sys
 import re
 import os
 import json
+import logging
 import shutil
 import subprocess
 import asyncio
 import time
 import platform
 import urllib.request
-from pathlib import Path
 from typing import List, Any, Optional, Dict
 from rich.console import Console, Group
-from rich.prompt import Prompt
 from rich.text import Text
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
-from rich.live import Live
 from rich.table import Table
 from rich.markup import escape
-from rich.panel import Panel
-from rich.style import Style
-from rich.progress_bar import ProgressBar
 
 from .scraper import TopCinemaScraper, clean_show_title
 from .history import HistoryManager
@@ -49,10 +44,11 @@ from .config import (
     __version__, __author__, __license__,
     CONFIG_DIR, CONFIG_FILE,
     ASCII_ART, GOODBYE_ART,
-    THEMES, DEFAULT_THEME, SPINNERS
+    THEMES, DEFAULT_THEME
 )
 
 CONSOLE = Console()
+logger = logging.getLogger(__name__)
 GITHUB_REPO_URL = "https://github.com/np4abdou1/cenima-cli"
 GITHUB_API_URL = "https://api.github.com/repos/np4abdou1/cenima-cli"
 
@@ -110,57 +106,49 @@ def get_github_stars(allow_network: bool = True) -> int:
 
 
 class Config:
-    
+
     def __init__(self):
         self.theme = DEFAULT_THEME
-        # Player options
-        self.simple_mode = True   # Launch mpv minimally (mirrors the known-good command)
-        self.send_headers = False # Inject --referrer/--user-agent when simple_mode is on
-        self.referer = ""
-        self.user_agent = ""
-        self.fullscreen = True
-        self.hwdec = False
-        self.cache_pause = False
+        self.mpv_args: List[str] = []
         self.load()
-    
+
     def load(self):
         try:
             if CONFIG_FILE.exists():
-                data = json.loads(CONFIG_FILE.read_text())
+                data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
                 self.theme = data.get("theme", DEFAULT_THEME)
-                self.simple_mode = bool(data.get("simple_mode", True))
-                self.send_headers = bool(data.get("send_headers", False))
-                self.referer = data.get("referer", "")
-                self.user_agent = data.get("user_agent", "")
-                self.fullscreen = bool(data.get("fullscreen", True))
-                self.hwdec = bool(data.get("hwdec", False))
-                self.cache_pause = bool(data.get("cache_pause", False))
-        except Exception:
-            pass
-    
+                raw_args = data.get("mpv_args", [])
+                self.mpv_args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
+        except Exception as exc:
+            logger.warning("Failed to load config from %s: %s", CONFIG_FILE, exc)
+
     def save(self):
+        tmp_file = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".tmp")
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            CONFIG_FILE.write_text(json.dumps(self.to_dict(), indent=2))
-        except Exception:
-            pass
-    
+            tmp_file.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+            os.replace(tmp_file, CONFIG_FILE)
+        except Exception as exc:
+            logger.warning("Failed to save config to %s: %s", CONFIG_FILE, exc)
+            try:
+                if tmp_file.exists():
+                    tmp_file.unlink()
+            except OSError:
+                pass
+
     def to_dict(self) -> Dict:
         return {
             "theme": self.theme,
-            "simple_mode": self.simple_mode,
-            "send_headers": self.send_headers,
-            "referer": self.referer,
-            "user_agent": self.user_agent,
-            "fullscreen": self.fullscreen,
-            "hwdec": self.hwdec,
-            "cache_pause": self.cache_pause,
+            "mpv_args": self.mpv_args,
         }
-    
+
     def get_theme(self) -> Dict:
         if self.theme == "auto":
             return get_auto_theme()
-        return THEMES.get(self.theme, get_auto_theme())
+        theme = THEMES.get(self.theme)
+        if theme is None:
+            return get_auto_theme()
+        return theme
 
 
 class CinemaCLI:
@@ -192,15 +180,9 @@ class CinemaCLI:
         return self.config.get_theme()
     
     def check_deps(self):
-        missing = []
-        if not shutil.which("fzf"):
-            missing.append("fzf")
         if not shutil.which("mpv"):
-            missing.append("mpv")
-        
-        if missing:
-            CONSOLE.print(f"[bold red]✗ Missing dependencies:[/bold red] {', '.join(missing)}")
-            CONSOLE.print("[dim]Install with: sudo apt install fzf mpv[/dim]")
+            CONSOLE.print("[bold red]✗ Missing dependency:[/bold red] mpv")
+            CONSOLE.print("[dim]Install mpv (and optionally fzf) using your package manager.[/dim]")
             sys.exit(1)
     
     def log(self, emoji: str, message: str, style: str = "dim"):
@@ -247,7 +229,7 @@ class CinemaCLI:
         info_text.append("OS        ", style=f"bold {theme['secondary']}")
         try:
             info_text.append(f"│ {platform.system()} {platform.release()}\n")
-        except:
+        except Exception:
             info_text.append("│ Unknown\n")
         
         info_text.append("🎨 ", style=theme['accent'])
@@ -273,8 +255,8 @@ class CinemaCLI:
             info_text.append(" (Star us!)\n", style="dim")
         info_text.append("\n")
         info_text.append("💡 Global Shortcuts\n", style=f"bold {theme['primary']}")
-        info_text.append("   b/Esc: Back    q/exit: Quit\n", style="dim")
-        info_text.append("   h/history: History     c/theme: Settings\n", style="dim")
+        info_text.append("   Esc: Quit/Back    exit: Quit\n", style="dim")
+        info_text.append("   /history: History  /theme: Settings  /help: Help\n", style="dim")
         
         grid.add_row(art, info_text)
         
@@ -286,17 +268,6 @@ class CinemaCLI:
         theme = self.theme
         CONSOLE.print(Text(GOODBYE_ART, style=theme["primary"]))
         CONSOLE.print(f"[{theme['secondary']}]Thanks for using cenima-cli![/{theme['secondary']}]")
-    
-    def _show_picker_intro(self, title: Optional[str] = None, subtitle: Optional[str] = None):
-        CONSOLE.clear()
-        if not title and not subtitle:
-            return
-        theme = self.theme
-        if title:
-            CONSOLE.print(f"[bold {theme['primary']}]{escape(title)}[/bold {theme['primary']}]")
-        if subtitle:
-            CONSOLE.print(f"[dim]{escape(subtitle)}[/dim]")
-        CONSOLE.print("")
     
     def _print_focus_panel(self, title: str, subtitle: Optional[str] = None):
         theme = self.theme
@@ -316,12 +287,15 @@ class CinemaCLI:
         if not items:
             return None
 
+        # Clear console so lingering banner/stats/spinners disappear
+        CONSOLE.clear()
+
         # 1. Native fzf subprocess with ANSI color support
         if shutil.which("fzf"):
             try:
                 cmd = [
                     "fzf",
-                    "--height=15",
+                    "--height=100%",
                     "--layout=reverse",
                     "--border",
                     "--prompt=" + prompt,
@@ -420,14 +394,14 @@ class CinemaCLI:
             return items[idx]
         return None
     
-    def handle_command(self, query: str) -> bool:
+    async def handle_command(self, query: str) -> bool:
         cmd = query.strip().lower()
         
         if cmd == "/theme":
             self.theme_selector()
             return True
         elif cmd in ("/history", "/recent"):
-            self.show_history_menu()
+            await self.show_history_menu()
             return True
         elif cmd == "/help":
             self.show_help()
@@ -442,7 +416,7 @@ class CinemaCLI:
         
         return False
 
-    def show_history_menu(self):
+    async def show_history_menu(self):
         self.banner()
         theme = self.theme
         history_items = self.history.get_recent_history(limit=30)
@@ -497,7 +471,7 @@ class CinemaCLI:
                 header="Action for selected history item"
             )
             if choice_idx == 0:
-                asyncio.run(self.search_and_open(selected.show_title))
+                await self.search_and_open(selected.show_title)
             elif choice_idx == 1:
                 self.history.clear_history()
                 self.log("✓", "History cleared", theme['primary'])
@@ -519,7 +493,7 @@ class CinemaCLI:
         
         def fmt_theme(name):
             if name == "auto":
-                auto_theme = get_auto_theme()
+                auto_theme = get_auto_theme(refresh=True)
                 indicator = " ★" if name == self.config.theme else ""
                 return f"[{auto_theme['primary']}]● Auto Detect ({auto_theme['source']}){indicator}[/]"
             colors = THEMES[name]
@@ -538,11 +512,6 @@ class CinemaCLI:
             self.config.save()
             self.log("✓", f"Theme changed to {theme_names[idx].title()}", f"bold {self.theme['primary']}")
             time.sleep(0.5)
-    
-    def _hex_to_rgb(self, hex_color: str) -> str:
-        hex_color = hex_color.lstrip('#')
-        r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
-        return f"{r};{g};{b}"
     
     def show_help(self):
         self.banner()
@@ -591,7 +560,7 @@ class CinemaCLI:
                 sys.exit(0)
             
             if query.startswith('/'):
-                if self.handle_command(query):
+                if await self.handle_command(query):
                     continue
             
             self.log("🔄", "Fetching results...")
@@ -677,7 +646,7 @@ class CinemaCLI:
             await self.show_details_flow(selected_show)
     
     async def show_details_flow(self, show):
-        self.banner()
+        CONSOLE.clear()
         theme = self.theme
         
         self.log("🔄", "Loading details...")
@@ -873,10 +842,12 @@ class CinemaCLI:
             if not selected_season:
                 break
             
-            await self.handle_season_episodes(selected_season, seasons)
+            action = await self.handle_season_episodes(selected_season, seasons)
+            if action == "search":
+                break
     
     async def handle_season_episodes(self, selected_season, all_seasons=None):
-        self.banner()
+        CONSOLE.clear()
         theme = self.theme
         
         if self.current_overview_panel:
@@ -929,7 +900,9 @@ class CinemaCLI:
             
             self.current_episode_index = episodes.index(selected_ep)
             
-            await self.play_episode(selected_ep, season_label)
+            action = await self.play_episode(selected_ep, season_label)
+            if action == "search":
+                return "search"
     
     async def play_episode(self, episode, season_label):
         theme = self.theme
@@ -938,7 +911,7 @@ class CinemaCLI:
         episode_title = self._clean_episode_title(episode.get('title', ''), episode_num)
         season_num = self.current_season.get('season_number') if self.current_season else None
         
-        self.banner()
+        CONSOLE.clear()
         if self.current_overview_panel:
             CONSOLE.print(self.current_overview_panel)
         
@@ -967,7 +940,7 @@ class CinemaCLI:
         if episode_title:
             display_context += f" · {episode_title}"
         
-        await self.select_and_play(
+        return await self.select_and_play(
             servers,
             display_context,
             is_episode=True,
@@ -1029,8 +1002,8 @@ class CinemaCLI:
                 )
 
                 if is_episode and self.current_episodes:
-                    await self.prompt_next_episode()
-                return
+                    return await self.prompt_next_episode()
+                return None
 
         # Fallback: probe servers if VidTube is unavailable or extraction failed
         checker = ServerHealthChecker(referer=scraper.base_url)
@@ -1141,7 +1114,8 @@ class CinemaCLI:
         )
         
         if is_episode and self.current_episodes:
-            await self.prompt_next_episode()
+            return await self.prompt_next_episode()
+        return None
     
     async def prompt_next_episode(self):
         theme = self.theme
@@ -1154,7 +1128,7 @@ class CinemaCLI:
         next_ep = self.current_episodes[self.current_episode_index + 1]
         next_num = self._normalize_episode_number(next_ep.get('episode_number') or next_ep.get('display_number'))
         
-        self.banner()
+        CONSOLE.clear()
         CONSOLE.print(f"[bold {theme['primary']}]⏭️  Next Episode Available[/bold {theme['primary']}]")
         CONSOLE.print(f"[dim]Episode {next_num}[/dim]")
         CONSOLE.print("")
@@ -1170,29 +1144,11 @@ class CinemaCLI:
         if idx == 0:
             self.current_episode_index += 1
             season_label = self.current_season.get('display_label') or f"Season {self.current_season.get('season_number', '?')}"
-            await self.play_episode(next_ep, season_label)
-        elif idx == 1:
-            pass
+            return await self.play_episode(next_ep, season_label)
+        elif idx == 2:
+            return "search"
+        return None
     
-    def _build_mpv_command(self, url, referer=None, title=None, sock=None):
-        cmd = ["mpv"]
-        if sock:
-            cmd.append(f"--input-ipc-server={sock}")
-        if title:
-            cmd.append(f"--title={title}")
-        req_referer = referer or getattr(url, "referer", None)
-        is_vidtube = any(k in str(url).lower() for k in ["cdn-video", "serv-stream", "vidtube"]) or \
-                     bool(req_referer and any(k in str(req_referer).lower() for k in ["vidtube", "cdn-video"]))
-        if is_vidtube:
-            if not req_referer or not any(k in str(req_referer).lower() for k in ["vidtube", "down.vidtube.one"]):
-                req_referer = "https://down.vidtube.one/"
-            cmd.append(f"--referrer={req_referer}")
-            cmd.append("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        elif req_referer:
-            cmd.append(f"--referrer={req_referer}")
-        cmd.append(str(url))
-        return cmd
-
     def play_video(
         self,
         url: str,
@@ -1231,6 +1187,7 @@ class CinemaCLI:
             title=title or self.current_show_title or "cenima-cli",
             start_time=start_time,
             referer=referer,
+            extra_args=self.config.mpv_args or None,
         )
 
         if mpv_state and mpv_state.time_pos and mpv_state.time_pos > 5:

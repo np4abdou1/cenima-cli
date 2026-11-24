@@ -12,6 +12,7 @@ mpv JSON IPC protocol (see ``man mpv`` -> JSON IPC):
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import threading
 import time
@@ -19,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import http.server
 import socketserver
 
+logger = logging.getLogger(__name__)
 
 
 class MpvIpcError(Exception):
@@ -156,6 +158,8 @@ class StreamProxy:
                 if "Range" in self.headers:
                     req_headers["Range"] = self.headers["Range"]
 
+                resp = None
+                headers_sent = False
                 try:
                     resp = session.get(target_url, headers=req_headers, stream=True, timeout=15)
                     self.send_response(resp.status_code)
@@ -164,14 +168,30 @@ class StreamProxy:
                         if val:
                             self.send_header(h, val)
                     self.end_headers()
+                    headers_sent = True
 
                     for chunk in resp.iter_content(chunk_size=128 * 1024):
                         try:
                             self.wfile.write(chunk)
                         except (BrokenPipeError, ConnectionResetError):
                             break
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("StreamProxy request error for %s: %s", target_url, exc)
+                    if not headers_sent:
+                        try:
+                            self.send_error(502, "Upstream stream error")
+                        except OSError:
+                            pass
+                finally:
+                    if resp is not None:
+                        try:
+                            resp.close()
+                        except Exception:
+                            pass
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
 
             def log_message(self, format, *args):
                 pass
@@ -320,7 +340,8 @@ def run_mpv_monitored(
         rc = proc.returncode
     except KeyboardInterrupt:
         rc = 0
-    except Exception:
+    except Exception as exc:
+        logger.error("Failed to launch mpv: %s", exc)
         rc = 1
     finally:
         watcher.stop()

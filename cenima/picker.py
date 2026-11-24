@@ -15,8 +15,10 @@ from rich.table import Table
 from rich.markup import escape, MarkupError
 
 @contextmanager
-def raw_terminal(fd: int = sys.stdin.fileno()):
+def raw_terminal(fd: Optional[int] = None):
     """Safely enter and exit raw terminal mode with guaranteed restoration."""
+    if fd is None:
+        fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
@@ -272,11 +274,6 @@ class CustomPrompt:
                             hist_idx = min(len(history), hist_idx + 1)
                             input_str = history[hist_idx] if hist_idx < len(history) else ""
                     elif len(ch) == 1 and ch.isprintable():
-                        if not input_str:
-                            if ch == 'q': return "/exit"
-                            if ch == 'h': return "/history"
-                            if ch == 'c': return "/theme"
-                            if ch == 'b': return "/back"
                         input_str += ch
                     
                     live.update(render(True), refresh=True)

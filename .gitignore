@@ -77,3 +77,5 @@ old_stuff/
 archive/
 *.html
 *.log
+codebase_dump.txt
+execution_report.md

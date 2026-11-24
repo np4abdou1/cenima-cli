@@ -1,8 +1,10 @@
+import logging
 import re
-import math
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from curl_cffi import requests
+
+logger = logging.getLogger(__name__)
 
 class StreamURL(str):
     """String subclass that preserves stream-specific headers and referer."""
@@ -138,7 +140,8 @@ class ServerProcessor:
             if resp.status_code != 200:
                 return None
             html2 = resp.text
-        except Exception:
+        except Exception as exc:
+            logger.debug("VidTube Pro fetch failed for %s: %s", next_url, exc)
             return None
         
         soup2 = BeautifulSoup(html2, "html.parser")
@@ -225,7 +228,8 @@ class ServerProcessor:
                     return StreamURL(mp4_match.group(1), referer=ref_host, headers=x_headers)
                         
             return None
-        except Exception:
+        except Exception as exc:
+            logger.debug("XFileSharing extraction failed for %s: %s", url, exc)
             return None
 
     def extract(self, url: str, referer: str = None) -> str:
@@ -248,7 +252,8 @@ class ServerProcessor:
                     unpacked = self._handle_vidtube_one(resp.text, referer=url)
                     if unpacked:
                         return unpacked
-            except Exception:
+            except Exception as exc:
+                logger.debug("Embed extraction failed for %s: %s", url, exc)
                 pass
 
         # UpDown, Mdiaload, BowFile, Ddownload, 1CloudFile, Nitroflare (XFileSharing servers)
@@ -271,7 +276,8 @@ class ServerProcessor:
                             direct_url = self._handle_vidtube_pro(dl_url, dl_resp.text, headers)
                             if direct_url:
                                 return direct_url
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("VidTube download page failed for %s: %s", dl_url, exc)
                         continue
 
             try:
@@ -280,7 +286,8 @@ class ServerProcessor:
                     pro_url = self._handle_vidtube_pro(url, resp.text, headers)
                     if pro_url: return pro_url
                     return self._handle_vidtube_one(resp.text, referer=url)
-            except Exception:
+            except Exception as exc:
+                logger.debug("VidTube fallback extraction failed for %s: %s", url, exc)
                 pass
 
         # Generic XFileSharing fallback
