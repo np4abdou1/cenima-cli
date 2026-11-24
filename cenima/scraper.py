@@ -5,7 +5,7 @@ import os
 import time
 from curl_cffi import requests
 from typing import List, Dict, Optional, Any
-from urllib.parse import quote, urlparse, unquote
+from urllib.parse import quote, urlparse, unquote, urljoin, parse_qsl, urlencode
 from bs4 import BeautifulSoup
 
 from .config import (
@@ -24,7 +24,9 @@ def clean_arabic_title(text: str) -> str:
     if not text:
         return text
     
-    text = re.sub(r'[\u0600-\u06FF]+', '', text)
+    # Remove catalog wrappers, not the language of the title itself.
+    text = re.sub(r'^\s*(?:(?:مشاهدة|تحميل)\s+)?(?:فيلم|مسلسل|انمي|أنمي)\s+', '', text)
+    text = re.sub(r'\s+(?:مترجم(?:ة)?|مدبلج(?:ة)?)(?:\s+(?:اون|أون)\s+لاين)?\s*$', '', text)
     
     parts = text.split()
     seen_numbers = set()
@@ -55,7 +57,7 @@ def clean_show_title(title: str) -> str:
         # Arabic & English episode indicators (e.g. الحلقة 13, الحلقة 1 و 2, Episode 13, Ep 13, E13)
         r'\b(?:episode|ep)\s*\d*\b|\b[eE]\d+\b|\b(?:الحلقة|حلقة)\s*(?:\d+(?:\s*(?:و|-|to|&|and)\s*\d+)*|\bال[^\s]+\b)?',
         # Part indicators (e.g. الجزء الثاني, Part 2)
-        r'\b(?:part)\s*\d*\b|\bالجزء\s*(?:الاول|الأول|الثاني|الثالث|الرابع|الخامس|\d+)?',
+        r'\b(?:part)\s+\d+\b|\bالجزء\s*(?:الاول|الأول|الثاني|الثالث|الرابع|الخامس|\d+)?',
         # Quality & release tags
         r'\b(?:1080p|720p|480p|360p)\b',
         r'\b(?:WEB-DL|BluRay|HDTV|CAM|WEBRip|HDRip)\b',
@@ -188,11 +190,11 @@ class TopCinemaScraper:
 
     def _save_domain_cache(self, domain: str):
         try:
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            DOMAIN_CACHE_FILE.write_text(json.dumps({
+            from .atomic import atomic_write_json
+            atomic_write_json(DOMAIN_CACHE_FILE, {
                 "domain": domain,
                 "timestamp": time.time()
-            }))
+            })
         except Exception:
             pass
 
@@ -368,6 +370,136 @@ class TopCinemaScraper:
                         existing.setdefault('metadata', {})[meta_k] = meta_v
                         
         return deduped
+
+    def get_latest_episodes(self, limit=15, max_pages=6) -> List[Dict]:
+        """Collect distinct shows from the homepage and its linked episode archive."""
+        if limit <= 0:
+            return []
+        section = self._latest_home_section('episode')
+        results, seen = [], set()
+        def collect(cards):
+            for episode in self._parse_latest_cards(cards, 'episode'):
+                name = clean_text(episode.get('show_title', '')).casefold()
+                key = (episode.get('show_type'), name or episode['url'])
+                if key not in seen:
+                    seen.add(key)
+                    results.append(episode)
+                if len(results) >= limit:
+                    break
+        collect(section)
+        link = section.select_one('.Title--Box a[href]')
+        next_url = self._episode_archive_url(link['href']) if link else None
+        visited = set()
+        for page_number in range(1, max(0, min(max_pages, 10)) + 1):
+            if len(results) >= limit or not next_url:
+                break
+            parts = urlparse(next_url)
+            marker = (unquote(parts.path).rstrip('/').casefold(), tuple(sorted(parse_qsl(parts.query))))
+            if marker in visited:
+                break
+            visited.add(marker)
+            response = self.session.get(next_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            response.raise_for_status()
+            self._handle_response_redirect(response)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            listing = soup.select_one('.Posts--List')
+            if listing is None:
+                raise ValueError('The episode archive layout was not recognized. Retry the catalog.')
+            collect(listing)
+            next_link = soup.select_one('a[rel~=next]')
+            if next_link is None:
+                next_link = next((a for a in soup.select('.page-numbers a[href]')
+                    if a.get_text(strip=True).casefold() in ('»', 'التالي', 'next', str(page_number + 1))), None)
+            next_url = self._episode_archive_url(next_link['href'], next_url) if next_link else None
+        return results[:limit]
+
+    def _episode_archive_url(self, href, base=None):
+        target = self._normalize_url_domain(urljoin(base or self.base_url + '/', href))
+        parts = urlparse(target)
+        if parts.scheme not in ('http', 'https') or parts.netloc != urlparse(self.base_url).netloc:
+            return None
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query['key'] = 'episodes'
+        return parts._replace(query=urlencode(query), fragment='').geturl()
+
+    def get_latest_movies(self) -> List[Dict]:
+        return self._latest_added('movie')
+
+    def _latest_added(self, kind) -> List[Dict]:
+        return self._parse_latest_cards(self._latest_home_section(kind), kind)
+
+    def _latest_home_section(self, kind):
+        """Use the explicitly labelled homepage section, never the promo slider.
+
+        Preserve provider order and deduplicate page URLs. The episode getter
+        groups these cards by show. Fail visibly when a layout is unrecognized.
+        """
+        response = self.session.get(self.base_url + '/', timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        response.raise_for_status()
+        self._handle_response_redirect(response)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        wanted = 'الحلقات' if kind == 'episode' else 'الأفلام'
+        section = None
+        for block in soup.select('.Wide--Contents'):
+            heading = block.select_one('.Title--Box h3')
+            label = clean_text(heading.get_text()) if heading else ''
+            if wanted.replace('أ', 'ا') in label.replace('أ', 'ا') and 'المضافة' in label:
+                section = block
+                break
+        if section is None:
+            raise ValueError('The latest-added catalog section was not found. The site layout may have changed.')
+        return section
+
+    def _parse_latest_cards(self, section, kind):
+        results, seen = [], set()
+        for card in section.select('.Small--Box'):
+            item = self._parse_search_result(card)
+            if not item:
+                continue
+            url = self._normalize_url_domain(urljoin(self.base_url + '/', item['url']))
+            parsed = urlparse(url)
+            if parsed.scheme not in ('http', 'https') or parsed.netloc != urlparse(self.base_url).netloc:
+                continue
+            url = parsed._replace(fragment='').geturl()
+            if url in seen:
+                continue
+            item['url'] = url
+            if kind == 'movie':
+                if item['type'] != 'movie':
+                    continue
+            else:
+                text = unquote(url) + ' ' + item['title']
+                number = re.search(r'(?:الحلقة|حلقة|episode|ep)[\s\-_:]+(\d+(?:\.\d+)?)', text, re.I)
+                if not number:
+                    continue
+                title = re.split(r'\s+(?:الموسم[\s-]|الحلقة[\s-]|(?:season|episode|ep)\s*\d|S\d+(?:E\d+)?)',
+                                 item['title'], maxsplit=1, flags=re.I)[0]
+                item.update(type='episode', show_type='anime' if item['type'] == 'anime' else 'series', show_title=clean_show_title(title),
+                    episode_number=number[1], display_number=number[1],
+                    season_number=extract_season_number(text), season_part=extract_season_part(text))
+            seen.add(url)
+            results.append(item)
+        return results
+
+    def get_episode_context(self, episode: Dict) -> Dict:
+        """Resolve the selected episode's parent show lazily for shared history."""
+        url = self._normalize_url_domain(episode['url'])
+        response = self.session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        response.raise_for_status()
+        self._handle_response_redirect(response)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        context = dict(episode, url=url, show_url=url)
+        # The episode remains playable even if a parent-show link is unavailable.
+        for anchor in soup.select('.breadcrumbs a[href], .breadcrumb a[href]'):
+            target = self._normalize_url_domain(urljoin(self.base_url + '/', anchor['href']))
+            path = unquote(urlparse(target).path)
+            if (urlparse(target).netloc == urlparse(self.base_url).netloc and
+                    ('/series/' in path or '/anime/' in path) and
+                    not re.search(r'الموسم|الحلقة|season|episode|/s\d', path, re.I)):
+                context['show_url'] = target
+                context['show_title'] = clean_show_title(anchor.get_text(' ', strip=True)) or episode['show_title']
+                break
+        return context
     
     def _parse_search_result(self, item) -> Optional[Dict]:
         try:
@@ -437,7 +569,7 @@ class TopCinemaScraper:
             }
         
         except Exception as e:
-            print(f"[WARN] Failed to parse search result: {e}")
+            self.last_error = f"Failed to parse search result: {e}"
             return None
     
     def get_show_details(self, url: str) -> Optional[Dict]:
@@ -456,7 +588,7 @@ class TopCinemaScraper:
                 return self.get_movie_details(url)
         
         except Exception as e:
-            print(f"[ERROR] Failed to get show details: {e}")
+            self.last_error = f"Failed to get show details: {e}"
             return None
     
     def get_movie_details(self, url: str) -> Optional[Dict]:
@@ -500,7 +632,7 @@ class TopCinemaScraper:
             return details
         
         except Exception as e:
-            print(f"[ERROR] Failed to get movie details: {e}")
+            self.last_error = f"Failed to get movie details: {e}"
             return None
     
     def get_series_details(self, url: str, show_type: str = "series") -> Optional[Dict]:
@@ -534,7 +666,7 @@ class TopCinemaScraper:
                     text = link.get_text().lower()
                     title = link.get("title", "").lower()
                     
-                    if (("/ series/" in href or "/anime/" in href) and 
+                    if (("/series/" in href or "/anime/" in href) and
                         ("الموسم" in href or "season" in href or 
                          "season" in text or "الموسم" in title)):
                         if href not in seen_urls:
@@ -575,9 +707,7 @@ class TopCinemaScraper:
             return details
         
         except Exception as e:
-            print(f"[ERROR] Failed to get series details: {e}")
-            import traceback
-            traceback.print_exc()
+            self.last_error = f"Failed to get series details: {e}"
             return None
     
     def _parse_metadata(self, soup: BeautifulSoup, url: str) -> Dict:
@@ -838,9 +968,7 @@ class TopCinemaScraper:
             }
         
         except Exception as e:
-            print(f"[WARN] Failed to parse season: {e}")
-            import traceback
-            traceback.print_exc()
+            self.last_error = f"Failed to parse season: {e}"
             return None
     
     def _parse_episode_link(self, link_elem, url: str) -> Optional[Dict]:

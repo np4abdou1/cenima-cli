@@ -1,9 +1,198 @@
-<div align="center">
+# CINEMA CLI
 
-# CENIMA-CLI ( by np4abdou1 ) - ALPHA
+**Browse movies and TV shows, play with mpv, and download safely from your terminal.**
 
-### REVIVAL [in progress...]
+An interactive Python CLI for catalog discovery, playback, managed downloads,
+resume progress, and Arabic-friendly terminal use.
 
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/b77ee381-f667-481d-9d2d-97cb760bb02b" />
+<p>
+  <a href="https://github.com/np4abdou1/cenima-cli/actions"><img src="https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=github-actions&logoColor=white" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-only-blue" alt="License"></a>
+  <img src="https://img.shields.io/badge/python-3.9+-3776AB?logo=python&logoColor=white" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platforms">
+</p>
 
-</div>
+Original author: [np4abdou1](https://github.com/np4abdou1)
+Collaborator: [Abdelilah Elgallati](https://github.com/AbdelilahElgallati)
+
+## Preview
+
+<p align="center">
+  <picture>
+    <source media="(max-width: 900px)" srcset="docs/assets/landing-80.svg">
+    <img src="docs/assets/landing-160.svg" alt="cenima-cli welcome screen" width="100%">
+  </picture>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(max-width: 900px)" srcset="docs/assets/results-80.svg">
+    <img src="docs/assets/results-160.svg" alt="cenima-cli search results" width="100%">
+  </picture>
+</p>
+
+The screenshots are generated offline from fixture data by
+`python tests/preview_ui.py`.
+
+## Highlights
+
+- Rich terminal interface with alternate-buffer navigation
+- Movies, seasons, episodes, and latest-added catalogs
+- Resume watching and recent watch history
+- Managed offline library and Watch Later
+- Built-in yt-dlp downloads, optional aria2c, and guarded IDM handoff
+- Direct/HLS proxy with headers and range-aware resume
+- FFprobe and disk-space completion safeguards
+- Arabic and Unicode filename preservation
+- Short commands, fuzzy title ranking, and keyboard-first navigation
+- Redacted rotating diagnostics, settings export/import, and `/doctor`
+
+## Installation
+
+### Windows
+
+Install Python and mpv, then run:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[download]"
+mpv --version
+cinema-cli
+```
+
+If scripts are not on `PATH`, launch directly:
+
+```powershell
+.\.venv\Scripts\cinema-cli.exe
+```
+
+### Linux
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ".[download]"
+sudo apt install mpv ffmpeg
+.venv/bin/cinema-cli
+```
+
+### macOS
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e ".[download]"
+brew install mpv ffmpeg yt-dlp
+.venv/bin/cinema-cli
+```
+
+Native tools are not installed automatically. Use `/doctor` to check Python,
+mpv, yt-dlp, FFmpeg, ffprobe, aria2c, config directory, and download directory.
+
+## Run
+
+From the repository root:
+
+```powershell
+python -m pip install -e ".[download]"
+cinema-cli
+```
+
+Available launchers:
+
+```text
+cinema-cli
+cenima-cli
+cenima
+python main.py
+```
+
+Check the version or environment without starting the TUI:
+
+```text
+cinema-cli --version
+cinema-cli --doctor
+cinema-cli --help
+cinema-cli --export-settings <path>
+cinema-cli --import-settings <path>
+```
+
+## Search and navigation
+
+Search by title, select a result, then choose a season or episode. `Enter`
+selects, arrow keys navigate, `/` filters the current list, and `Esc` or `b`
+returns while in a menu. Inside text fields, `b` remains ordinary text.
+
+| Command | Shortcut | Purpose |
+| --- | --- | --- |
+| `/history` | `/h` | Recent watch history |
+| `/continue` | `/c`, `Ctrl+R` | Continue watching |
+| `/library` | `/l`, `Ctrl+L` | Browse managed downloads |
+| `/downloads` | `/d` | Queue, retry, cancel |
+| `/watch-later` | `/wl` | Saved titles |
+| `/last-eps` | `/le` | Latest episode additions |
+| `/last-mv` | `/lm` | Latest movie additions |
+| `/settings` | `/s` | Download folder and preferences |
+| `/doctor` | `/do` | Environment diagnostics |
+| `/folder` | `/f` | Open the media folder |
+| `/theme` | `/theme` | Terminal theme |
+| `/export-settings` | `/x` | Export redacted settings |
+| `/import-settings` | `/i` | Import validated settings |
+
+For minor title spelling mistakes, search results are reranked by fuzzy similarity,
+while exact and close matches remain first.
+
+## Downloads
+
+The built-in engine uses yt-dlp through a header-preserving loopback proxy.
+aria2c is optional for direct files, while IDM is a guarded Windows handoff.
+HLS and signed/header-protected streams remain on the supervised built-in route.
+
+Downloads provide:
+
+- One bounded background worker
+- Persistent SQLite queue
+- Per-item cancellation and retry
+- Source-isolated partial files
+- Validator-aware resume
+- Disk-space preflight and headroom checks
+- FFprobe duration/video-packet validation
+- SHA-256 completion metadata
+- Redacted diagnostics
+
+Downloads remain paused or recoverable after application exit. The app does not
+promise that an externally delegated IDM download is complete or managed.
+
+## Configuration and diagnostics
+
+State is stored in:
+
+- `~/.config/cenima-cli/config.json`
+- `~/.config/cenima-cli/history.json`
+- `~/.config/cenima-cli/watch_later.json`
+- `~/.config/cenima-cli/media.sqlite3`
+- `~/.config/cenima-cli/logs/cenima.log`
+
+The diagnostic log rotates at 2 MB with three backups. URLs, secrets, cookies,
+authorization values, and user paths are redacted before writing.
+
+Use `/doctor` or `cinema-cli --doctor` to display the environment and log location.
+
+## Development
+
+```sh
+python -m pip install -e ".[download,dev]"
+python -m unittest discover -s tests -q
+python -m build
+python -m twine check dist/*
+```
+
+Live provider checks are opt-in and are not part of the default unit suite.
+Keep `tests/` and useful `tools/` in source control. Generated caches, virtual
+environments, build output, wheels, egg metadata, logs, local database files,
+and downloaded qualification media are not pull-request source.
+
+CI runs unit/integration tests and packaging checks across Windows, Linux,
+macOS, and Python 3.9–3.12.
+
+## License
+
+GPL-3.0-only. See [LICENSE](LICENSE).

@@ -24,7 +24,7 @@ except ImportError:
 
 if HAS_FASTAPI:
     app = FastAPI(
-        title="Cenima CLI API",
+        title="Cinema CLI API",
         description="REST API for TopCinema browsing and streaming",
         version="0.2.0"
     )
@@ -77,6 +77,8 @@ async def get_show_details(url: str = Query(..., alias="url")):
             season_obj = Season(
                 season_number=s["season_number"],
                 display_label=s["display_label"],
+                url=s["url"],
+                season_part=s.get("season_part"),
                 poster=s.get("poster"),
                 episodes=[] 
             )

@@ -74,9 +74,11 @@ GOODBYE_ART = r"""
 """
 
 from .accent import get_auto_theme, detect_system_accent
+from .ui import PALETTE
 
 # --- Theme Definitions ---
 THEMES = {
+    "cinema": dict(PALETTE),
     "auto": get_auto_theme(),
     "blue": {"primary": "#7eb3d4", "secondary": "#9ac9e3", "accent": "#5a9bc7", "error": "#d97979"},
     "red": {"primary": "#d97979", "secondary": "#e59393", "accent": "#c55a5a", "error": "#d97979"},
@@ -97,7 +99,7 @@ THEMES = {
     "sunset": {"primary": "#e48b7a", "secondary": "#f0a19a", "accent": "#c66d5c", "error": "#d97979"},
 }
 
-DEFAULT_THEME = "auto"
+DEFAULT_THEME = "cinema"
 
 # --- Spinners ---
 SPINNERS = ["dots", "dots2", "dots3", "line", "star", "growVertical", "arc", "bouncingBar", "aesthetic"]
