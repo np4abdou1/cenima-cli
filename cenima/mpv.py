@@ -12,6 +12,7 @@ mpv JSON IPC protocol (see ``man mpv`` -> JSON IPC):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import threading
@@ -23,6 +24,7 @@ import hashlib
 import re
 from urllib.parse import urljoin, urlsplit, parse_qsl, urlencode, urlunsplit
 
+logger = logging.getLogger(__name__)
 
 
 class MpvIpcError(Exception):
@@ -268,6 +270,8 @@ class StreamProxy:
                 if "Range" in self.headers:
                     req_headers["Range"] = self.headers["Range"]
 
+                resp = None
+                headers_sent = False
                 try:
                     with proxy._resource_lock:
                         if proxy._stopping.is_set():
@@ -329,9 +333,13 @@ class StreamProxy:
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 except Exception as exc:
+                    logger.debug("StreamProxy request error for %s: %s", target_url, exc)
                     proxy.last_error = f'{type(exc).__name__}: {exc}'
                     if not sent_headers:
-                        self.send_error(502, "Upstream stream unavailable")
+                        try:
+                            self.send_error(502, "Upstream stream unavailable")
+                        except OSError:
+                            pass
                 finally:
                     with proxy._resource_lock:
                         proxy._active.pop(id(session), None)
@@ -341,7 +349,10 @@ class StreamProxy:
                     except Exception:
                         pass
                     finally:
-                        session.close()
+                        try:
+                            session.close()
+                        except Exception:
+                            pass
 
             def log_message(self, format, *args):
                 pass
@@ -527,7 +538,8 @@ def run_mpv_monitored(
                       title=title or 'Unknown', return_code=rc)
     except KeyboardInterrupt:
         rc = 130
-    except Exception:
+    except Exception as exc:
+        logger.error("Failed to launch mpv: %s", exc)
         rc = 1
     finally:
         if proc is not None and proc.poll() is None:

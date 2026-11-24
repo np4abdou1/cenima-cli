@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 import sys
-import os
 import re
+import os
 import json
+import logging
 import shutil
+import subprocess
 import asyncio
 import argparse
 import textwrap
 import time
+import platform
+import urllib.request
+from contextlib import nullcontext
 from difflib import SequenceMatcher
 from pathlib import Path
-from contextlib import nullcontext
-from typing import List, Any, Optional, Dict, Union
+from typing import List, Any, Optional, Dict
 from rich.console import Console, Group
 from rich.text import Text
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.table import Table
 from rich.markup import escape
-from rich.panel import Panel
-from rich import box
 
 from .scraper import TopCinemaScraper, clean_show_title
 from .history import HistoryManager
@@ -26,10 +28,15 @@ from .models import WatchStatus, NavigationOutcome, PlaybackOutcome, canonical_c
 from .mpv import run_mpv_monitored
 from .picker import RichPicker, CustomPrompt, PickerAction
 from .accent import get_auto_theme
-from .ui import (theme_tokens, landing, app_bar, breadcrumb, callout,
-                 details_card, result_row, PickerRow)
 from .health import ServerHealthChecker, LIVE, SLOW, OFFLINE
 from .processor import ServerProcessor
+from .config import (
+    __version__, __author__, __license__,
+    CONFIG_DIR, CONFIG_FILE,
+    ASCII_ART, GOODBYE_ART,
+    THEMES, DEFAULT_THEME
+)
+
 
 class _LazyScraper:
     def __init__(self):
@@ -46,15 +53,13 @@ class _LazyScraper:
     def __getattr__(self, name):
         return getattr(self._get_instance(), name)
 
-scraper = _LazyScraper()
-from .config import (
 
-    __version__, __author__, __license__,
-    CONFIG_DIR, CONFIG_FILE,
-    THEMES, DEFAULT_THEME
-)
+scraper = _LazyScraper()
 
 CONSOLE = Console()
+logger = logging.getLogger(__name__)
+GITHUB_REPO_URL = "https://github.com/np4abdou1/cenima-cli"
+GITHUB_API_URL = "https://api.github.com/repos/np4abdou1/cenima-cli"
 
 
 def download_engine_labels(manager_keys):
@@ -94,13 +99,53 @@ def format_seconds(secs: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def get_github_stars(allow_network: bool = True) -> int:
+    cache_file = CONFIG_DIR / "stars_cache.json"
+    cache_duration = 3600
+
+    if cache_file.exists():
+        try:
+            data = json.loads(cache_file.read_text())
+            if not allow_network or (time.time() - data.get('timestamp', 0) < cache_duration):
+                return data.get('stars', 0)
+        except Exception:
+            pass
+
+    if not allow_network:
+        return 0
+
+    try:
+        req = urllib.request.Request(GITHUB_API_URL)
+        req.add_header('Accept', 'application/vnd.github.v3+json')
+        with urllib.request.urlopen(req, timeout=3) as response:
+            data = json.loads(response.read().decode())
+            stars = data.get('stargazers_count', 0)
+            try:
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(json.dumps({
+                    'stars': stars,
+                    'timestamp': time.time()
+                }))
+            except Exception:
+                pass
+            return stars
+    except Exception:
+        if cache_file.exists():
+            try:
+                data = json.loads(cache_file.read_text())
+                return data.get('stars', 0)
+            except Exception:
+                pass
+        return 0
+
+
 class Config:
-    
+
     def __init__(self):
         self.theme = DEFAULT_THEME
-        # Player options
-        self.simple_mode = True   # Launch mpv minimally (mirrors the known-good command)
-        self.send_headers = False # Inject --referrer/--user-agent when simple_mode is on
+        self.mpv_args: List[str] = []
+        self.simple_mode = True
+        self.send_headers = False
         self.referer = ""
         self.user_agent = ""
         self.fullscreen = True
@@ -115,19 +160,21 @@ class Config:
         self.welcome_theme = "midnight"
         self.welcome_motion = False
         self.load()
-    
+
     def load(self):
         try:
             if CONFIG_FILE.exists():
                 try:
-                    data = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
+                    data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
                     if not isinstance(data, dict):
-                        raise ValueError('Config root is not an object')
+                        raise ValueError("Config root is not an object")
                 except (json.JSONDecodeError, ValueError, OSError):
-                    backup = CONFIG_FILE.with_name(CONFIG_FILE.name + '.corrupt.bak')
+                    backup = CONFIG_FILE.with_name(CONFIG_FILE.name + ".corrupt.bak")
                     backup.write_bytes(CONFIG_FILE.read_bytes())
                     data = {}
                 self.theme = data.get("theme", DEFAULT_THEME)
+                raw_args = data.get("mpv_args", [])
+                self.mpv_args = [str(a) for a in raw_args if isinstance(a, str)] if isinstance(raw_args, list) else []
                 self.simple_mode = bool(data.get("simple_mode", True))
                 self.send_headers = bool(data.get("send_headers", False))
                 self.referer = data.get("referer", "")
@@ -145,14 +192,17 @@ class Config:
                 self.welcome_motion = bool(data.get("welcome_motion", False))
         except Exception:
             pass
-    
+
     def save(self):
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             existing = {}
             if CONFIG_FILE.exists():
-                existing = json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
-                if not isinstance(existing, dict):
+                try:
+                    loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        existing = loaded
+                except Exception:
                     existing = {}
             data = dict(existing)
             data.update(self.to_dict())
@@ -161,10 +211,11 @@ class Config:
             return True
         except Exception:
             return False
-    
+
     def to_dict(self) -> Dict:
         return {
             "theme": self.theme,
+            "mpv_args": self.mpv_args,
             "simple_mode": self.simple_mode,
             "send_headers": self.send_headers,
             "referer": self.referer,
@@ -181,13 +232,16 @@ class Config:
             "welcome_theme": self.welcome_theme,
             "welcome_motion": self.welcome_motion,
         }
-    
+
     def get_theme(self) -> Dict:
         if self.theme == "auto":
             if not getattr(self, "_auto_theme", None):
                 self._auto_theme = get_auto_theme()
-            return theme_tokens(self._auto_theme)
-        return theme_tokens(THEMES.get(self.theme, THEMES["cinema"]))
+            return self._auto_theme
+        theme = THEMES.get(self.theme)
+        if not theme:
+            return get_auto_theme()
+        return theme
 
 
 class CinemaCLI:
@@ -196,13 +250,24 @@ class CinemaCLI:
         self.history = HistoryManager()
         from .watch_later import WatchLaterStore
         self.watch_later = WatchLaterStore()
-        self.picker_hint = "↑↓ navigate • Enter select • Esc / b back"
+        self.picker_hint = "↑↓ navigate • Enter select • Esc back"
         self.current_show_title = ""
         self.current_overview_panel = None
         self.current_episodes = []
         self.current_episode_index = 0
         self.current_season = None
+        self.github_stars = get_github_stars(allow_network=False)
+        import threading
+        threading.Thread(target=self._refresh_stars_background, daemon=True).start()
         self.check_deps()
+
+    def _refresh_stars_background(self):
+        try:
+            stars = get_github_stars(allow_network=True)
+            if stars:
+                self.github_stars = stars
+        except Exception:
+            pass
 
     @property
     def media_store(self):
@@ -224,107 +289,214 @@ class CinemaCLI:
 
     @property
     def theme(self) -> Dict:
-        return theme_tokens(self.config.get_theme())
-    
+        return self.config.get_theme()
+
     def check_deps(self):
-        missing = []
         if not shutil.which("mpv"):
-            missing.append("mpv")
-        
-        if missing:
-            CONSOLE.print(f"[bold red]✗ Missing dependencies:[/bold red] {', '.join(missing)}")
-            CONSOLE.print(callout("PLAYER REQUIRED", "Install mpv and add it to PATH, then reopen the terminal.",
-                                  "warning", self.theme))
+            CONSOLE.print("[bold red]✗ Missing dependency:[/bold red] mpv")
+            CONSOLE.print("[dim]Install mpv (and optionally fzf) using your package manager.[/dim]")
             sys.exit(1)
-    
-    def _set_breadcrumbs(self, *parts):
-        self._breadcrumbs = ["Home"]
-        query = getattr(self, "_search_query", "")
-        if query:
-            self._breadcrumbs.append(f'Search: "{query}"')
-        if getattr(self, "current_show_title", ""):
-            self._breadcrumbs.append(self.current_show_title)
-        self._breadcrumbs.extend(parts)
 
     def log(self, emoji: str, message: str, style: str = "dim"):
-        level = "info"
-        if "✗" in emoji:
-            level = "error"
-        elif "⚠" in emoji:
-            level = "warning"
-        elif emoji in ("✓", "💾", "👁️"):
-            level = "success"
-        labels = {"info": "STATUS", "error": "ACTION REQUIRED",
-                  "warning": "PLEASE CHECK", "success": "SAVED / COMPLETE"}
-        try:
-            message = Text.from_markup(message).plain
-        except Exception:
-            pass
-        panel = callout(labels[level], message, level, self.theme)
-        if level != "info" or emoji == "🎬":
-            self._notice = panel
-        self.banner()
-        CONSOLE.print(panel)
+        CONSOLE.print(f"[{style}]{emoji} {message}[/{style}]")
 
     def banner(self):
         CONSOLE.clear()
-        parts = getattr(self, "_breadcrumbs", ["Home"])
-        if parts == ["Home"]:
-            recent = self.history.get_recent_history(limit=30)
-            CONSOLE.print(landing(__version__, bool(shutil.which("mpv")), recent,
-                                  CONSOLE.width, self.theme))
-            CONSOLE.print(Text("  /continue  Resume   /library  Offline   /downloads  Queue   /settings  Folder",
-                               style=self.theme["muted"]))
-            CONSOLE.print()
+        theme = self.theme
+
+        grid = Table.grid(padding=(0, 2))
+        grid.add_column()
+        grid.add_column(justify="left", vertical="middle")
+
+        art = Text(ASCII_ART, style=theme["primary"])
+
+        info_text = Text()
+        fzf_ready = bool(shutil.which("fzf"))
+        engine_tag = "mpv + fzf" if fzf_ready else "mpv"
+        header_inner = f"  cenima-cli  v{__version__}  •  {engine_tag}  "
+        border_line = "─" * len(header_inner)
+
+        info_text.append(f"╭{border_line}╮\n", style=theme["accent"])
+        info_text.append("│  ", style=theme["accent"])
+        info_text.append("cenima-cli", style=f"bold {theme['primary']}")
+        info_text.append(f"  v{__version__}", style="dim")
+        info_text.append("  •  ", style=theme["accent"])
+        info_text.append(engine_tag, style=f"bold {theme['secondary']}")
+        info_text.append("  │\n", style=theme["accent"])
+        info_text.append(f"╰{border_line}╯\n", style=theme["accent"])
+        info_text.append("\n")
+
+        history_items = self.history.get_recent_history(limit=5000)
+        watched_eps = sum(1 for i in history_items if i.episode_number and (i.status == WatchStatus.COMPLETED or i.progress_pct >= 85.0))
+        watched_movies = sum(1 for i in history_items if i.content_type == "movie" and (i.status == WatchStatus.COMPLETED or i.progress_pct >= 85.0))
+        total_watch_time = sum(i.time_pos for i in history_items)
+        hours = int(total_watch_time // 3600)
+
+        try:
+            os_label = f"{platform.system()} {platform.release()}"
+        except Exception:
+            os_label = "Unknown"
+
+        if self.config.theme == "auto":
+            theme_label = f"Auto ({theme.get('source', 'System')})"
         else:
-            CONSOLE.print(app_bar(__version__, self.theme))
-            CONSOLE.print(breadcrumb(parts, self.theme, CONSOLE.width))
+            theme_label = self.config.theme.title()
+
+        if getattr(self, "github_stars", None) is None:
+            self.github_stars = get_github_stars(allow_network=False)
+
+        rows = [
+            ("Movies", f"{watched_movies} watched", None),
+            ("Episodes", f"{watched_eps} watched", None),
+            ("Watch Time", f"{hours} hours", None),
+            ("System", os_label, None),
+            ("Theme", theme_label, None),
+        ]
+        for label, value, val_style in rows:
+            info_text.append(f"  {label:<11} ", style=f"bold {theme['secondary']}")
+            info_text.append("│ ", style=theme["accent"])
+            info_text.append(f"{value}\n", style=val_style or "")
+
+        info_text.append(f"  {'GitHub':<11} ", style=f"bold {theme['secondary']}")
+        info_text.append("│ ", style=theme["accent"])
+        if self.github_stars > 0:
+            info_text.append(f"★ {self.github_stars}", style="bold #daa520")
+            info_text.append(" (Thank you!)\n", style="dim")
+        else:
+            info_text.append("★ 0", style="#daa520")
+            info_text.append(" (Star us!)\n", style="dim")
+
+        info_text.append("\n")
+        info_text.append("  Commands\n", style=f"bold {theme['primary']}")
+        info_text.append("    /continue   /history     /last-eps   /last-mv\n", style="dim")
+        info_text.append("    /downloads  /library     /watch-later /settings\n", style="dim")
+        info_text.append("    /theme      /doctor      /help       exit (Esc)", style="dim")
+
+        grid.add_row(art, info_text)
+        CONSOLE.print(grid)
+        CONSOLE.print("")
 
     def goodbye(self):
         CONSOLE.clear()
-        CONSOLE.print(callout("UNTIL NEXT TIME", "Your watch history is saved. See you at the next story.",
-                              "success", self.theme))
+        theme = self.theme
+        CONSOLE.print(Text(GOODBYE_ART, style=theme['primary']))
+        CONSOLE.print("[dim]Thanks for watching with cenima-cli! 🎬[/dim]\n")
 
-    def _show_picker_intro(self, title=None, subtitle=None):
-        self.banner()
-        if title:
-            self._print_focus_panel(title, subtitle)
-
-    def _print_focus_panel(self, title, subtitle=None):
-        CONSOLE.print(callout(title, subtitle or "Choose an item below to continue.", theme=self.theme))
+    def _print_focus_panel(self, title: str, subtitle: Optional[str] = None):
+        theme = self.theme
+        CONSOLE.print(f"[bold {theme['primary']}]{escape(title)}[/bold {theme['primary']}]")
+        if subtitle:
+            CONSOLE.print(f"[dim]{escape(subtitle)}[/dim]")
+        CONSOLE.print("")
 
     def run_fzf(
         self,
-        items: List[Any],
+        items: List[str],
         prompt: str = "❯ ",
         header: Optional[str] = None,
         title: Optional[str] = None,
         subtitle: Optional[str] = None,
         initial_index: int = 0,
-        notice=None,
-        shortcuts=None
-    ) -> Optional[Union[int, PickerAction]]:
-        # Keep the historical method name for callers; Rich owns the visual surface.
+        shortcuts: Optional[Dict] = None,
+        notice: Any = None,
+        multi: bool = False,
+    ) -> Any:
         if not items:
-            return None
-        details = getattr(self, "_details", None)
-        notice = notice or getattr(self, "_notice", None)
-        self._notice = None
-        def context():
-            card = details_card(details, self.current_show_title, CONSOLE.width, self.theme) if details else None
-            if not notice:
-                return card
-            combined = Group(card, notice) if card else notice
-            height = len(CONSOLE.render_lines(combined, CONSOLE.options, pad=False))
-            return notice if height > CONSOLE.height - 12 else combined
-        picker = RichPicker(CONSOLE, self.theme,
-                            breadcrumbs=getattr(self, "_breadcrumbs", ["Home"]), context=context, shortcuts=shortcuts)
-        try:
-            label = Text.from_markup(title or "Choose an option").plain
-        except Exception:
-            label = title or "Choose an option"
-        return picker.pick(items, format_func=lambda item: item, title=label,
-                           subtitle=subtitle or header or "", initial_index=initial_index)
+            return [] if multi else None
+
+        CONSOLE.clear()
+
+        if shutil.which("fzf"):
+            try:
+                cmd = [
+                    "fzf",
+                    "--height=100%",
+                    "--layout=reverse",
+                    "--border",
+                    "--prompt=" + prompt,
+                    "--pointer=❯",
+                    "--info=inline",
+                    "--ansi",
+                ]
+                if multi:
+                    cmd.append("--multi")
+
+                def to_plain(text_str: str) -> str:
+                    try:
+                        return Text.from_markup(str(text_str)).plain
+                    except Exception:
+                        return str(text_str)
+
+                def to_ansi(text_str: str) -> str:
+                    try:
+                        temp_c = Console(force_terminal=True, color_system="truecolor")
+                        with temp_c.capture() as capture:
+                            temp_c.print(Text.from_markup(str(text_str)), end="")
+                        return capture.get()
+                    except Exception:
+                        return to_plain(text_str)
+
+                header_parts = []
+                if title:
+                    header_parts.append(to_plain(title))
+                if subtitle:
+                    header_parts.append(to_plain(subtitle))
+                if header:
+                    header_parts.append(to_plain(header))
+                if notice is not None:
+                    notice_text = getattr(notice, "renderable", notice)
+                    if isinstance(notice_text, Text):
+                        header_parts.append(notice_text.plain.replace("\n", " · "))
+                    elif isinstance(notice_text, str):
+                        header_parts.append(to_plain(notice_text))
+
+                if header_parts:
+                    cmd.append(f"--header={' · '.join(p for p in header_parts if p)}")
+
+                ansi_items = [to_ansi(str(item)) for item in items]
+                input_data = "\n".join([f"{i+1}. {item}" for i, item in enumerate(ansi_items)])
+
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=None,
+                    text=True
+                )
+                out, _ = proc.communicate(input=input_data)
+
+                if proc.returncode == 0 and out.strip():
+                    indices = []
+                    for selected_line in out.strip().splitlines():
+                        match = re.match(r"^(\d+)\.", selected_line)
+                        if match:
+                            idx = int(match.group(1)) - 1
+                            if 0 <= idx < len(items):
+                                indices.append(idx)
+                    if multi:
+                        return indices
+                    return indices[0] if indices else None
+                elif proc.returncode == 130:
+                    return [] if multi else None
+            except Exception:
+                pass
+
+        picker = RichPicker(CONSOLE, self.theme)
+        display_title = title or ""
+        if subtitle:
+            display_title += f"\n[dim]{subtitle}[/dim]"
+        if header:
+            display_title += f"\n[bold]{header}[/bold]"
+
+        if multi:
+            idx = picker.pick(items, format_func=lambda x: str(x), title=display_title)
+            return [idx] if idx is not None else []
+
+        return picker.pick(
+            items,
+            format_func=lambda x: str(x),
+            title=display_title
+        )
 
     def run_fzf_objects(
         self,
@@ -334,7 +506,9 @@ class CinemaCLI:
         title: Optional[str] = None,
         subtitle: Optional[str] = None,
         header: Optional[str] = None,
-        initial_index: int = 0
+        initial_index: int = 0,
+        shortcuts: Optional[Dict] = None,
+        notice: Any = None,
     ) -> Optional[Any]:
         if not items:
             return None
@@ -346,12 +520,14 @@ class CinemaCLI:
             header=header,
             title=title,
             subtitle=subtitle,
-            initial_index=initial_index
+            initial_index=initial_index,
+            shortcuts=shortcuts,
+            notice=notice,
         )
-        if isinstance(idx, int) and 0 <= idx < len(items):
+        if idx is not None and 0 <= idx < len(items):
             return items[idx]
         return None
-    
+
     async def handle_command(self, query: str) -> bool:
         cmd = query.strip().lower()
         command_aliases = {
@@ -383,7 +559,7 @@ class CinemaCLI:
             self.run_fzf(['Back'], title='Settings exported', subtitle=str(path))
             return True
         elif cmd == "/import-settings":
-            path = CustomPrompt(CONSOLE, self.theme).ask(title='IMPORT SETTINGS', initial_value=str(Path.home() / 'cenima-settings.json'))
+            path = CustomPrompt(CONSOLE, self.theme).ask("Import settings path ❯ ")
             if path:
                 try:
                     from .settings_io import read_settings_import
@@ -436,15 +612,14 @@ class CinemaCLI:
             self.show_help()
             return True
         elif cmd == "/version":
-            self._breadcrumbs = ["Home", "About"]
-            self._details = None
             self.banner()
-            self.run_fzf(["Back to Search"], title="About Cinema", notice=callout(
-                f"CINEMA CLI v{__version__}", f"By {__author__} · {__license__}", theme=self.theme))
+            CONSOLE.print(f"[bold]cenima-cli[/bold] v{__version__}")
+            CONSOLE.print(f"[dim]Author: {__author__} • License: {__license__}[/dim]")
+            input("\nPress Enter to continue...")
             return True
         elif cmd == "/back":
             return True
-        
+
         return False
 
     async def show_watch_later(self):
@@ -453,15 +628,19 @@ class CinemaCLI:
             if not items:
                 self.run_fzf(["Back"], title="Watch Later", subtitle="No saved titles yet")
                 return
-            selected = self.run_fzf_objects(items, lambda item:
-                PickerRow((item.get('title') or item.get('show_title') or 'Untitled',
-                           item.get('episode_number') or 'Movie'),
-                          ('Title', 'Episode')),
-                title="Watch Later", subtitle="Enter opens saved catalog page")
+            selected = self.run_fzf_objects(
+                items,
+                lambda item: f"📌 {escape(item.get('title') or item.get('show_title') or 'Untitled')} ({item.get('episode_number') or 'Movie'})",
+                prompt="📌 Watch Later ❯ ",
+                title="📌 Watch Later",
+                subtitle="Enter opens saved catalog page",
+            )
             if selected is None:
                 return
-            choice = self.run_fzf(["Open", "Remove", "Back"], title=
-                                  selected.get('title') or selected.get('show_title') or 'Watch Later')
+            choice = self.run_fzf(
+                ["Open", "Remove", "Back"],
+                title=selected.get('title') or selected.get('show_title') or 'Watch Later',
+            )
             if choice == 0:
                 await self.show_details_flow({
                     'title': selected.get('title') or selected.get('show_title'),
@@ -472,45 +651,51 @@ class CinemaCLI:
                 self.watch_later.remove(selected)
 
     async def show_history_menu(self):
-        self._breadcrumbs = ["Home", "Watch history"]
-        self._details = None
         self.banner()
         theme = self.theme
         history_items = self.history.get_recent_history(limit=30)
-        
+
         if not history_items:
             self.log("ℹ️", "No watch history yet", theme['secondary'])
-            self.run_fzf(["Back to Search"], title="Watch history")
+            input("\nPress Enter to continue...")
             return
 
         def fmt_history_item(item):
-            episode = f"S{item.season_number or '?'} E{item.episode_number}" if item.episode_number else "Movie"
-            status = "Watched" if item.status == WatchStatus.COMPLETED else "Continue" if item.time_pos > 0 else "Unwatched"
-            progress = f"{int(item.progress_pct)}% · {format_seconds(item.time_pos)}"
-            return PickerRow((item.show_title, episode, progress, status),
-                             ("Title", "Episode", "Progress", "Status"))
+            badge = "👁️" if item.status == WatchStatus.COMPLETED or item.progress_pct >= 85 else "⏳" if item.status == WatchStatus.IN_PROGRESS else "📺"
+            title = escape(item.show_title)
+
+            detail = ""
+            if item.season_number or item.episode_number:
+                s_str = f"S{item.season_number}" if item.season_number else ""
+                e_str = f"E{item.episode_number}" if item.episode_number else ""
+                detail = f" — {s_str}{e_str}".strip()
+                if item.episode_title:
+                    detail += f" ({item.episode_title})"
+
+            prog_str = ""
+            if item.duration > 0:
+                pos_fmt = format_seconds(item.time_pos)
+                dur_fmt = format_seconds(item.duration)
+                prog_str = f" [yellow][{int(item.progress_pct)}% · {pos_fmt}/{dur_fmt}][/]"
+            elif item.status == WatchStatus.COMPLETED:
+                prog_str = " [green][Watched][/]"
+
+            return f"{badge} [b]{title}[/]{detail}{prog_str}"
 
         header = f"📊 {len(history_items)} items in history"
         selected = self.run_fzf_objects(
             history_items,
             fmt_history_item,
             prompt="🕒 History ❯ ",
-            title="Continue watching",
+            title="🕒 Recent Watch History",
             subtitle=header,
             header=header
         )
 
         if selected:
             options = [
-                "Resume saved title",
                 f"🔍 Search '{selected.show_title}'",
-                "Remove from Watch Later" if self.watch_later.contains({
-                    'show_url': selected.show_url, 'title': selected.show_title,
-                    'content_type': selected.content_type,
-                    'season_number': selected.season_number,
-                    'episode_number': selected.episode_number,
-                    'season_part': selected.season_part,
-                }) else "Add to Watch Later",
+                "▶️ Resume if available",
                 "🗑️ Clear Watch History",
                 "⬅️ Back"
             ]
@@ -521,24 +706,10 @@ class CinemaCLI:
                 header="Action for selected history item"
             )
             if choice_idx == 0:
-                await self.resume_progress(selected)
-            elif choice_idx == 1:
                 await self.search_and_open(selected.show_title)
+            elif choice_idx == 1:
+                await self.resume_progress(selected)
             elif choice_idx == 2:
-                saved = {
-                    'title': selected.show_title,
-                    'show_url': selected.show_url,
-                    'url': selected.episode_url or selected.show_url,
-                    'content_type': selected.content_type,
-                    'season_number': selected.season_number,
-                    'episode_number': selected.episode_number,
-                    'season_part': selected.season_part,
-                }
-                if self.watch_later.contains(saved):
-                    self.watch_later.remove(saved)
-                else:
-                    self.watch_later.add(saved)
-            elif choice_idx == 3:
                 self.history.clear_history()
                 self.log("✓", "History cleared", theme['primary'])
                 time.sleep(1)
@@ -546,27 +717,32 @@ class CinemaCLI:
     async def show_latest(self, kind):
         from .download import media_title
         label = 'Latest added episodes' if kind == 'episode' else 'Latest added movies'
-        self._search_query, self._details = '', None
         self.current_show_title = ''
-        self._breadcrumbs = ['Home', label]
         operation = scraper.get_latest_episodes if kind == 'episode' else scraper.get_latest_movies
         items = await self._load_with_retry(label, operation, empty_message=f'No {label.lower()} are listed right now.')
         if not items:
             return
         index = 0
         while True:
-            self._breadcrumbs, self._details, self._notice = ['Home', label], None, None
             def format_item(item):
                 if kind == 'movie':
-                    return result_row(item, clean_show_title(item['title']))
+                    clean_t = clean_show_title(item['title'])
+                    year = (item.get('metadata') or {}).get('year')
+                    year_str = f" ({year})" if year and str(year).lower() != 'n/a' else ""
+                    quality = (item.get('metadata') or {}).get('quality')
+                    q_str = f" [{quality}]" if quality else ""
+                    return f"🎬 {escape(clean_t)}{year_str}{q_str}"
                 season = str(item.get('season_number') or '?').zfill(2)
                 episode = self._normalize_episode_number(item['episode_number']).zfill(2)
-                return PickerRow((item['show_title'],
-                    f'S{season}E{episode}',
-                    (item.get('metadata') or {}).get('quality') or 'Unknown'), ('Title', 'Episode', 'Quality'))
-            selected = self.run_fzf_objects(items, format_item, title=label,
+                quality = (item.get('metadata') or {}).get('quality') or 'Unknown'
+                return f"📺 {escape(item['show_title'])} · S{season}E{episode} [{escape(str(quality))}]"
+
+            selected = self.run_fzf_objects(
+                items, format_item, title=label,
                 subtitle=('Newest added episode per show' if kind == 'episode' else 'Provider added order') +
-                         ' · Enter actions · Esc / b back', initial_index=index)
+                         ' · Enter actions · Esc back',
+                initial_index=index,
+            )
             if selected is None:
                 return
             index = items.index(selected)
@@ -579,12 +755,21 @@ class CinemaCLI:
                 continue
             self.current_show_title = context['show_title']
             self.current_show_url = context['show_url']
-            self.current_season = {'season_number': context.get('season_number'),
-                'season_part': context.get('season_part'), 'display_label': f"Season {context.get('season_number', '?')}"}
+            self.current_season = {
+                'season_number': context.get('season_number'),
+                'season_part': context.get('season_part'),
+                'display_label': f"Season {context.get('season_number', '?')}",
+            }
             self.current_episodes, self.current_episode_index = [context], 0
-            self._set_breadcrumbs(self.current_season['display_label'], f"Episode {context['episode_number']}")
-            action = self.run_fzf(['Play', 'Download', 'Open show page', 'Back'], title=media_title(self.current_show_title,
-                context.get('season_number'), context['episode_number'], context.get('season_part')))
+            action = self.run_fzf(
+                ['Play', 'Download', 'Open show page', 'Back'],
+                title=media_title(
+                    self.current_show_title,
+                    context.get('season_number'),
+                    context['episode_number'],
+                    context.get('season_part'),
+                ),
+            )
             if action == 0:
                 await self.play_episode(context, self.current_season['display_label'])
             elif action == 1:
@@ -593,10 +778,13 @@ class CinemaCLI:
                 show_url = context.get('show_url')
                 if not show_url or canonical_content_url(show_url) == canonical_content_url(context['url']):
                     self.run_fzf(['Back'], title='Show page unavailable',
-                        subtitle='The provider did not supply a parent show link for this episode.')
+                                 subtitle='The provider did not supply a parent show link for this episode.')
                     continue
-                outcome = await self.show_details_flow({'title': context['show_title'], 'url': show_url,
-                                                       'type': context.get('show_type') or 'series'})
+                outcome = await self.show_details_flow({
+                    'title': context['show_title'],
+                    'url': show_url,
+                    'type': context.get('show_type') or 'series',
+                })
                 if outcome == NavigationOutcome.SEARCH:
                     return
 
@@ -623,17 +811,21 @@ class CinemaCLI:
 
     def show_settings(self):
         from .storage import open_media_folder
-        self._breadcrumbs, self._details = ['Home', 'Settings'], None
         while True:
             folder = Path(self.config.download_dir).expanduser().resolve()
-            info = Text(str(folder), style=f"bold {self.theme['primary']} link {folder.as_uri()}")
-            info.append('\n' + folder.as_uri(), style=self.theme['muted'])
-            choice = self.run_fzf(['Change media folder and consolidate', 'Open media folder',
-                                   'Download preferences', 'Subtitle preferences',
-                                   'Completion notifications', 'Welcome theme', 'Back'],
-                title='Settings', notice=Panel(info, title='SHARED MEDIA FOLDER'),
-                subtitle='One folder for downloads, managers and library. Changing it pauses transfers and moves completed files.')
-            if choice in (None, 6):
+            choice = self.run_fzf(
+                [
+                    'Change media folder and consolidate',
+                    'Open media folder',
+                    'Download preferences',
+                    'Subtitle preferences',
+                    'Completion notifications',
+                    'Back',
+                ],
+                title='Settings',
+                subtitle=f'Media folder: {folder}',
+            )
+            if choice in (None, 5):
                 return
             try:
                 if choice == 1:
@@ -641,8 +833,11 @@ class CinemaCLI:
                 elif choice == 2:
                     quality_options = ['Best available', '1080p', '720p', '480p', '360p']
                     quality_values = ['best', '1080p', '720p', '480p', '360p']
-                    selected_quality = self.run_fzf(quality_options, title='Preferred download quality',
-                                                    subtitle='Unavailable quality falls back to the closest available stream')
+                    selected_quality = self.run_fzf(
+                        quality_options,
+                        title='Preferred download quality',
+                        subtitle='Unavailable quality falls back to the closest available stream',
+                    )
                     if selected_quality is not None:
                         self.config.download_quality = quality_values[selected_quality]
                     speed_options = ['Unlimited', '10 MB/s', '5 MB/s', '2 MB/s']
@@ -663,46 +858,47 @@ class CinemaCLI:
                 elif choice == 4:
                     selected = self.run_fzf(
                         ['Enable completion notifications', 'Disable completion notifications'],
-                        title='Completion notifications')
+                        title='Completion notifications',
+                    )
                     if selected is not None:
                         self.config.notifications = selected == 0
                         if not self.config.save():
                             raise OSError('Could not save notification preference.')
-                elif choice == 5:
-                    selected = self.run_fzf(
-                        ['Midnight Cinema', 'Noir Gold', 'Neon Cyan'],
-                        title='Welcome theme')
-                    if selected is not None:
-                        self.config.welcome_theme = ('midnight', 'noir-gold', 'neon-cyan')[selected]
-                        if not self.config.save():
-                            raise OSError('Could not save welcome theme.')
                 elif choice == 0:
                     CONSOLE.clear()
-                    value = CustomPrompt(CONSOLE, self.theme).ask(initial_value=str(folder), title='MEDIA FOLDER')
-                    if value in ('/exit', '/continue', '/library'):
+                    value = CustomPrompt(CONSOLE, self.theme).ask(f"Media folder [{folder}] ❯ ")
+                    if not value or value in ('/exit', '/continue', '/library'):
                         continue
                     with CONSOLE.status('Consolidating completed media…'):
                         result = self.set_download_folder(value)
-                    self.run_fzf(['Back'], title='Media folder saved',
-                        subtitle=f"{result['moved']} moved · {result['deduplicated']} identical copies consolidated",
-                        notice=Panel(Text(result['folder']), title='MEDIA FOLDER'))
+                    self.run_fzf(
+                        ['Back'],
+                        title='Media folder saved',
+                        subtitle=f"{result['moved']} moved · {result['deduplicated']} identical copies consolidated · {result['folder']}",
+                    )
             except (OSError, ValueError, RuntimeError) as exc:
-                self.run_fzf(['Back'], title='Folder change could not complete', notice=Panel(Text(str(exc))))
+                self.run_fzf(['Back'], title='Folder change could not complete', subtitle=str(exc))
 
     def _restore_media_context(self, metadata):
-        self._details = None
-        self._search_query = ''
         self.current_overview_panel = None
         self.current_show_title = metadata['show_title']
         self.current_show_url = metadata.get('show_url') or metadata.get('catalog_url')
         self.current_episode_index = 0
         number = metadata.get('episode_number')
-        self.current_season = ({'season_number': metadata.get('season_number'),
-            'display_label': metadata.get('season_label'), 'season_part': metadata.get('season_part')}
-            if number is not None else None)
-        self.current_episodes = ([{'url': metadata.get('episode_url') or metadata.get('catalog_url'),
-            'episode_number': number}] if number is not None else [])
-        self._set_breadcrumbs('Continue watching' if number is None else f'Episode {number}')
+        self.current_season = (
+            {
+                'season_number': metadata.get('season_number'),
+                'display_label': metadata.get('season_label'),
+                'season_part': metadata.get('season_part'),
+            }
+            if number is not None
+            else None
+        )
+        self.current_episodes = (
+            [{'url': metadata.get('episode_url') or metadata.get('catalog_url'), 'episode_number': number}]
+            if number is not None
+            else []
+        )
 
     async def resume_progress(self, progress):
         metadata = progress.model_dump()
@@ -713,50 +909,76 @@ class CinemaCLI:
             return
         metadata['catalog_url'] = catalog
         self._restore_media_context(metadata)
-        servers = await self._load_with_retry('Resolving saved title', scraper.fetch_episode_servers,
-                                              {'url': catalog}, empty_message='Saved title has no available servers.')
+        servers = await self._load_with_retry(
+            'Resolving saved title', scraper.fetch_episode_servers,
+            {'url': catalog}, empty_message='Saved title has no available servers.',
+        )
         if servers:
             self._resume_direct = True
             try:
-                await self.select_and_play(servers, progress.show_title,
-                    is_episode=progress.episode_number is not None, season_num=progress.season_number,
-                    ep_num=progress.episode_number, ep_title=progress.episode_title)
+                await self.select_and_play(
+                    servers, progress.show_title,
+                    is_episode=progress.episode_number is not None,
+                    season_num=progress.season_number,
+                    ep_num=progress.episode_number,
+                    ep_title=progress.episode_title,
+                )
             finally:
                 self._resume_direct = False
 
     def show_library(self):
-        self._breadcrumbs, self._details = ['Home', 'Local library'], None
         while True:
             items = self.media_store.media()
             if not items:
-                self.run_fzf(['Back'], title='No managed downloads yet',
-                             subtitle='Completed downloads appear here automatically.')
+                self.run_fzf(
+                    ['Back'],
+                    title='No managed downloads yet',
+                    subtitle='Completed downloads appear here automatically.',
+                )
                 return
-            selected = self.run_fzf_objects(items, lambda row: PickerRow((
-                row['download_title'], 'Ready' if row['available'] else 'Missing / changed'), ('Title', 'Status')),
-                title='Local library', subtitle='Offline playback · Esc / b back')
+            selected = self.run_fzf_objects(
+                items,
+                lambda row: f"{'✓' if row['available'] else '✗'} {escape(row['download_title'])} ({'Ready' if row['available'] else 'Missing / changed'})",
+                prompt="📁 Library ❯ ",
+                title='Local library',
+                subtitle='Offline playback · Esc back',
+            )
             if selected is None:
                 return
             if not selected['available']:
-                self.run_fzf(['Back'], title='Local file is missing or has changed',
-                             subtitle='Restore the original file or download the catalog item again.')
+                self.run_fzf(
+                    ['Back'],
+                    title='Local file is missing or has changed',
+                    subtitle='Restore the original file or download the catalog item again.',
+                )
                 continue
             self._restore_media_context(selected)
-            self.play_video(selected['path'], title=selected['download_title'],
-                season_num=selected.get('season_number'), ep_num=selected.get('episode_number'),
-                ep_title=selected.get('episode_title'), content_type=selected.get('content_type') or 'movie')
-            self._breadcrumbs, self._details = ['Home', 'Local library'], None
+            self.play_video(
+                selected['path'],
+                title=selected['download_title'],
+                season_num=selected.get('season_number'),
+                ep_num=selected.get('episode_number'),
+                ep_title=selected.get('episode_title'),
+                content_type=selected.get('content_type') or 'movie',
+            )
 
     async def show_download_queue(self):
-        self._breadcrumbs, self._details = ['Home', 'Downloads'], None
         while True:
             jobs = self.media_store.jobs()
             pending = sum(job['status'] in ('pending', 'running') for job in jobs)
             failed = sum(job['status'] in ('failed', 'cancelled') for job in jobs)
             worker_error = self._download_worker.error if hasattr(self, '_download_worker') else ''
-            choice = self.run_fzf(['Open live downloads', f'Start/resume queue ({pending})',
-                                   f'Retry failed/cancelled ({failed})', 'Back'], title='Downloads',
-                                   subtitle=worker_error or 'R: retry failed/cancelled downloads', shortcuts={'r': 2})
+            choice = self.run_fzf(
+                [
+                    'Open live downloads',
+                    f'Start/resume queue ({pending})',
+                    f'Retry failed/cancelled ({failed})',
+                    'Back',
+                ],
+                title='Downloads',
+                subtitle=worker_error or 'R: retry failed/cancelled downloads',
+                shortcuts={'r': 2},
+            )
             if choice in (None, 3):
                 return
             if choice in (1, 2):
@@ -775,39 +997,60 @@ class CinemaCLI:
         return False
 
     def show_live_downloads(self):
-        index = 0
         while True:
-            selected = RichPicker(CONSOLE, self.theme, breadcrumbs=self._breadcrumbs,
-                shortcuts={'r': 'retry'}).pick(self.media_store.jobs, format_func=self._download_row,
-                    title='Live downloads', subtitle='Enter: actions · R: retry failed item · Esc / b: back',
-                    initial_index=index)
+            jobs = self.media_store.jobs()
+            if not jobs:
+                self.run_fzf(['Back'], title='No queued downloads')
+                return
+            selected = RichPicker(CONSOLE, self.theme).pick(
+                jobs,
+                format_func=self._download_row,
+                title='Live downloads',
+                subtitle='Enter: actions · Esc: back',
+            )
             if selected is None:
                 return
             shortcut = isinstance(selected, PickerAction)
-            selected = selected.item if shortcut else selected
-            jobs = self.media_store.jobs()
-            index = next((i for i, job in enumerate(jobs) if job['id'] == selected['id']), 0)
+            if shortcut:
+                selected = selected.item
+            elif isinstance(selected, int):
+                selected = jobs[selected]
             latest = next((job for job in jobs if job['id'] == selected['id']), selected)
             if shortcut:
                 self._retry_download(latest['id'])
                 continue
             status = latest['status']
             retryable = status in ('failed', 'cancelled')
-            actions = (['Retry item'] + (['View error'] if latest['error'] else []) + ['Back'] if retryable else
-                       ['Cancel item', 'Back'] if status in ('pending', 'running') else ['Back'])
+            actions = (
+                ['Retry item'] + (['View error'] if latest['error'] else []) + ['Back']
+                if retryable
+                else ['Cancel item', 'Back']
+                if status in ('pending', 'running')
+                else ['Back']
+            )
             detail = latest['error'] or latest.get('progress') or status
-            decision = self.run_fzf(actions, title=escape(latest['download_title']),
-                subtitle='R: retry now' if retryable else '', shortcuts={'r': 0} if retryable else None,
-                notice=Panel(Text(detail[:300]), title='Transfer details'))
+            decision = self.run_fzf(
+                actions,
+                title=escape(latest['download_title']),
+                subtitle=detail[:200],
+                shortcuts={'r': 0} if retryable else None,
+            )
             if decision == 0 and retryable:
                 self._retry_download(latest['id'])
             elif decision == 0 and actions[0] == 'Cancel item':
                 self.download_worker.cancel(latest['id'])
             elif decision is not None and actions[decision] == 'View error':
-                lines = [part for line in latest['error'].splitlines()
-                         for part in textwrap.wrap(line, width=max(20, CONSOLE.width - 8))]
-                result = self.run_fzf([PickerRow((line,), ('Diagnostic',)) for line in lines] or ['No diagnostics'],
-                    title='Transfer failure', subtitle='R: retry now · Enter / Esc / b: return', shortcuts={'r': 'retry'})
+                lines = [
+                    part
+                    for line in latest['error'].splitlines()
+                    for part in textwrap.wrap(line, width=max(20, CONSOLE.width - 8))
+                ]
+                result = self.run_fzf(
+                    lines or ['No diagnostics'],
+                    title='Transfer failure',
+                    subtitle='Enter / Esc: return',
+                    shortcuts={'r': 'retry'},
+                )
                 if isinstance(result, PickerAction):
                     self._retry_download(latest['id'])
 
@@ -818,238 +1061,246 @@ class CinemaCLI:
         percentage = min(100, max(0, float(match[1]))) if match else None
         if job['status'] == 'completed':
             percentage = 100
-        bar = ('█' * int(percentage / 10) + '░' * (10 - int(percentage / 10)) + f' {percentage:.0f}%') if percentage is not None else '··········'
+        bar = (
+            '█' * int(percentage / 10) + '░' * (10 - int(percentage / 10)) + f' {percentage:.0f}%'
+            if percentage is not None
+            else '··········'
+        )
         status = {'pending': 'Queued', 'running': 'Active'}.get(job['status'], job['status'].title())
-        return PickerRow((job['download_title'], status, bar, progress),
-                         ('Title', 'Status', 'Progress', 'Transfer'))
+        return f"{escape(job['download_title'])} │ {status} │ {bar} │ {escape(progress)}"
 
     async def search_and_open(self, query: str):
-        self._search_query = query
-        self._breadcrumbs = ["Home", f'Search: "{query}"']
         self.banner()
         theme = self.theme
         self.log("🔄", f"Searching '{query}'...")
-        results = await self._load_with_retry("Searching watch history", scraper.search, query,
-                                              empty_message="No matching title found. Retry or return to history.")
+        results = await self._load_with_retry(
+            "Searching watch history", scraper.search, query,
+            empty_message="No matching title found. Retry or return to history.",
+        )
         if results:
             await self.show_details_flow(results[0])
         else:
             self.log("⚠️", "No matching show found", theme['error'])
             await asyncio.sleep(1.5)
-    
+
     def theme_selector(self):
-        self._breadcrumbs = ["Home", "Appearance"]
-        self._details = None
         theme_names = list(THEMES.keys())
-        
+
         def fmt_theme(name):
             if name == "auto":
-                auto_theme = get_auto_theme()
+                auto_theme = get_auto_theme(refresh=True)
                 indicator = " ★" if name == self.config.theme else ""
                 return f"[{auto_theme['primary']}]● Auto Detect ({auto_theme['source']}){indicator}[/]"
             colors = THEMES[name]
             indicator = " ★" if name == self.config.theme else ""
             return f"[{colors['primary']}]● {name.title()}{indicator}[/]"
-        
+
         idx = self.run_fzf(
             [fmt_theme(t) for t in theme_names],
             prompt="🎨 Theme ❯ ",
-            title="Appearance",
+            title="🎨 Select Theme",
             header="Current theme marked with ★"
         )
-        
+
         if idx is not None:
             self.config.theme = theme_names[idx]
-            self.config._auto_theme = None
             self.config.save()
             self.log("✓", f"Theme changed to {theme_names[idx].title()}", f"bold {self.theme['primary']}")
             time.sleep(0.5)
-    
-    def _hex_to_rgb(self, hex_color: str) -> str:
-        hex_color = hex_color.lstrip('#')
-        r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
-        return f"{r};{g};{b}"
-    
+
     def show_help(self):
-        self._breadcrumbs = ["Home", "Guide"]
-        self._details = None
         self.banner()
-        rows = []
-        for key, action in [('/h · /history', 'Continue watching and manage history'),
-                            ('/le · /last-eps', 'Newest added episode per show; play, download or open show'),
-                            ('/lm · /last-mv', 'Browse latest added movies'),
-                            ('/s · /settings', 'Choose the shared media folder'), ('/do · /doctor', 'Check Python and native tools'),
-                            ('/f · /folder', 'Open the shared media folder'),
-                            ('/c · /continue · Ctrl+R', 'Resume the latest unfinished title'),
-                            ('/l · /library · Ctrl+L', 'Browse downloaded media offline'),
-                            ('/d · /downloads', 'Resume pending or retry failed downloads'),
-                            ('/wl · /watch-later', 'Open catalog-saved Watch Later items'),
-                            ('/theme', 'Choose a color theme'), ('/version', 'Application version'),
-                            ('/exit', 'Save and quit'), ('↑ / ↓ · j / k', 'Navigate picker items'),
-                            ('Enter', 'Select an item'), ('/', 'Filter the current list'),
-                            ('Esc / b', 'Back in menus; b stays text while filtering/typing'),
-                            ('Home / End', 'First / last item'), ('PgUp / PgDn', 'Previous / next page'),
-                            ('← / → · Delete', 'Edit the search query'),
-                            ('↑ / ↓ in search', 'Recall previous queries'), ('Ctrl+C', 'Exit')]:
-            rows.append(PickerRow((key, action), ("Command / key", "Action")))
-        self.run_fzf(rows, title="Quick guide", subtitle="Esc / b returns to search")
+        theme = self.theme
+
+        CONSOLE.print(f"[bold {theme['primary']}]📚 Commands[/bold {theme['primary']}]")
+        CONSOLE.print("[dim]/history     - View recent watch history & continue watching[/dim]")
+        CONSOLE.print("[dim]/continue    - Resume your most recent unfinished title[/dim]")
+        CONSOLE.print("[dim]/last-eps    - Browse latest added episodes[/dim]")
+        CONSOLE.print("[dim]/last-mv     - Browse latest added movies[/dim]")
+        CONSOLE.print("[dim]/watch-later - Open your saved Watch Later list[/dim]")
+        CONSOLE.print("[dim]/downloads   - Manage background download queue[/dim]")
+        CONSOLE.print("[dim]/library     - Play downloaded offline media[/dim]")
+        CONSOLE.print("[dim]/settings    - Configure media folder, quality, subtitles[/dim]")
+        CONSOLE.print("[dim]/doctor      - Run environment diagnostics[/dim]")
+        CONSOLE.print("[dim]/theme       - Change color theme[/dim]")
+        CONSOLE.print("[dim]/help        - Show this help[/dim]")
+        CONSOLE.print("[dim]/version     - Show version info[/dim]")
+        CONSOLE.print("[dim]exit         - Quit the application[/dim]")
+        CONSOLE.print("")
+        CONSOLE.print(f"[bold {theme['primary']}]🎮 Controls[/bold {theme['primary']}]")
+        CONSOLE.print("[dim]↑/↓ (j/k) - Navigate item lists[/dim]")
+        CONSOLE.print("[dim]/         - Live filter list items[/dim]")
+        CONSOLE.print("[dim]PgUp/PgDn - Page scroll up / down[/dim]")
+        CONSOLE.print("[dim]Home/End  - Jump to top / bottom[/dim]")
+        CONSOLE.print("[dim]Enter     - Select item[/dim]")
+        CONSOLE.print("[dim]Esc (b)   - Go back / Clear filter[/dim]")
+        CONSOLE.print("[dim]Type      - Filter results[/dim]")
+        CONSOLE.print("")
+        input("Press Enter to continue...")
 
     async def search_flow(self):
         while True:
-            self._breadcrumbs = ["Home"]
-            self._details = None
-            self._notice = None
+            self.banner()
             theme = self.theme
 
-            recent = self.history.get_recent_history(limit=30)
-            def home_context():
-                unfinished = next((p for p in recent if p.time_pos > 0 and p.status != WatchStatus.COMPLETED), None)
-                header = landing(__version__, bool(shutil.which('mpv')), recent,
-                                  CONSOLE.width, theme)
-                if unfinished:
-                    elapsed = int(unfinished.time_pos)
-                    resume_text = Text()
-                    resume_text.append("▶ ", style=theme['primary'])
-                    resume_text.append("Continue  ", style=f"bold {theme['text']}")
-                    resume_text.append(unfinished.show_title, style=theme['text'])
-                    resume_text.append(" · ", style=theme['border'])
-                    resume_text.append(format_seconds(elapsed), style=theme['success'])
-                    resume_text.append(" · ", style=theme['border'])
-                    resume_text.append("press /c", style=theme['muted'])
-                    if unfinished.duration > 0:
-                        pct = max(0.0, min(100.0, unfinished.progress_pct))
-                        width = min(24, max(8, CONSOLE.width - 12))
-                        filled = int(round(width * pct / 100.0))
-                        resume_text.append("\n")
-                        resume_text.append("━" * filled + "─" * max(0, width - filled),
-                                           style=theme['success'])
-                    resume = Panel(resume_text, box=box.ROUNDED,
-                                   border_style=theme['border'], padding=(0, 1))
-                else:
-                    resume = Text("Search for your next title",
-                                  style=theme['muted'], no_wrap=True, overflow='ellipsis')
-                return Group(header, resume)
+            CONSOLE.print(f"[{theme['primary']}]🔍 Search [dim]• movies • series • anime[/dim][/{theme['primary']}]")
+            custom_prompt = CustomPrompt(CONSOLE, theme)
 
-            CONSOLE.clear()
-            custom_prompt = CustomPrompt(CONSOLE, theme, context=home_context)
-            
             if not hasattr(self, 'search_history'):
                 self.search_history = []
-                
-            query = custom_prompt.ask(f"[{theme['primary']}]>[/{theme['primary']}]",
-                                      history=self.search_history,
-                                      title='SEARCH',
-                                      placeholder='Search movies & series…',
-                                      hint='Enter to search · /h history · Q quit',
-                                      idle_refresh=bool(getattr(self.config, 'welcome_motion', False)),
-                                      welcome_actions=[
-                                          {'key': '/', 'command': ''},
-                                          {'key': 'l', 'command': '/library'},
-                                          {'key': 'h', 'command': '/history'},
-                                          {'key': 'c', 'command': '/continue'},
-                                          {'key': 'w', 'command': '/watch-later'},
-                                          {'key': 'd', 'command': '/downloads'},
-                                          {'key': 's', 'command': '/settings'},
-                                          {'key': 'o', 'command': '/doctor'},
-                                          {'key': 'q', 'command': '/exit'},
-                                      ])
-            
+
+            query = custom_prompt.ask(f"[{theme['accent']}]❯[/{theme['accent']}]", history=self.search_history)
+
             if not query:
                 continue
-                
+
             if not query.startswith('/'):
                 if not self.search_history or self.search_history[-1] != query:
                     self.search_history.append(query)
-            
+
             if query.lower() in ('exit', 'quit', '/exit', '/quit'):
                 self.goodbye()
                 sys.exit(0)
-            
+
             if query.startswith('/'):
                 if await self.handle_command(query):
                     continue
-            
-            self._search_query = query
-            self._breadcrumbs = ["Home", f'Search: "{query}"']
-            
-            results = await self._load_with_retry(
-                "Searching", scraper.search, query,
-                empty_message="No matches found. Retry or go back to edit your search.")
+
+            self.log("🔄", "Fetching results...")
+
+            with Progress(
+                SpinnerColumn("dots2"),
+                TextColumn("[progress.description]{task.description}"),
+                console=CONSOLE,
+                transient=True
+            ) as progress:
+                progress.add_task(f"[{theme['primary']}]Searching...", total=None)
+                try:
+                    results = await asyncio.to_thread(scraper.search, query)
+                except Exception as e:
+                    CONSOLE.print(f"[{theme['error']}]✗ Search failed: {e}[/{theme['error']}]")
+                    await asyncio.sleep(2)
+                    continue
+
             if not results:
+                self.log("⚠️", "No results found", f"{theme['error']}")
+                await asyncio.sleep(1.5)
                 continue
-            
+
             def get_relevance_score(result, search_query):
                 title = clean_show_title(result['title']).lower()
-                query_lower = search_query.lower()
+                query_lower = search_query.lower().strip()
                 norm_title = re.sub(r'[\W_]+', ' ', title).strip()
                 norm_query = re.sub(r'[\W_]+', ' ', query_lower).strip()
-                rating = result.get('metadata', {}).get('rating') or result.get('metadata', {}).get('imdb_rating') or 0
+                rating = float(result.get('metadata', {}).get('rating') or result.get('metadata', {}).get('imdb_rating') or 0)
                 similarity = SequenceMatcher(None, norm_title, norm_query).ratio()
-                
-                if norm_title == norm_query or title == query_lower:
-                    return (0, -rating)
-                elif norm_title.startswith(norm_query) or title.startswith(query_lower):
-                    return (1, -rating)
-                elif norm_query in norm_title or query_lower in title:
-                    return (2, -rating)
+                query_tokens = set(norm_query.split())
+                title_tokens = set(norm_title.split())
+
+                if norm_query and (norm_title == norm_query or title == query_lower):
+                    return (0, -rating, -similarity)
+                elif norm_query and (norm_title.startswith(norm_query) or title.startswith(query_lower)):
+                    return (1, -similarity, -rating)
+                elif norm_query and (norm_query in norm_title or query_lower in title):
+                    return (2, -similarity, -rating)
+                elif query_tokens and query_tokens.issubset(title_tokens):
+                    return (3, -similarity, -rating)
                 elif similarity >= 0.72:
-                    return (3, -similarity)
+                    return (4, -similarity, -rating)
                 else:
-                    return (4, -similarity)
-            
+                    return (5, -similarity, -rating)
+
             results.sort(key=lambda r: get_relevance_score(r, query))
-            
-            def fmt_res(result):
-                return result_row(result, clean_show_title(result.get("title", "")))
+
+            def fmt_res(r):
+                type_emoji = "🎬" if r['type'] == 'movie' else "📺" if r['type'] == 'series' else "🎌"
+                type_color = "blue" if r['type'] == 'movie' else "magenta" if r['type'] == 'series' else "cyan"
+                clean_t = clean_show_title(r['title'])
+
+                year = r.get('metadata', {}).get('year')
+                year_str = f" ({year})" if year and str(year).lower() != 'n/a' else ""
+
+                rating = r.get('metadata', {}).get('rating') or r.get('metadata', {}).get('imdb_rating')
+                rating_str = f" [gold1]★{rating}[/]" if rating else ""
+
+                quality = r.get('metadata', {}).get('quality')
+                quality_str = ""
+                if quality:
+                    q_upper = quality.upper()
+                    if 'CAM' in q_upper:
+                        q_color = "red"
+                    elif 'BLURAY' in q_upper:
+                        q_color = "cyan"
+                    elif 'WEB' in q_upper:
+                        q_color = "green"
+                    else:
+                        q_color = "white"
+                    quality_str = f" [{q_color}][{quality}][/]"
+
+                return f"{type_emoji} [{type_color}]{r['type'].title().ljust(8)}[/]│ {clean_t}{year_str}{rating_str}{quality_str}"
 
             results_count = len(results)
             result_header = f"📊 {results_count} {'match' if results_count == 1 else 'matches'}"
-            
+
             selected_show = self.run_fzf_objects(
                 results,
                 fmt_res,
                 prompt="🎯 Select ❯ ",
-                title="Search results",
+                title=f"🔍 Results for \"{query}\"",
                 header=result_header
             )
-            
+
             if not selected_show:
                 continue
-            
+
             await self.show_details_flow(selected_show)
-    
+
     async def show_details_flow(self, show):
-        self.banner()
+        CONSOLE.clear()
         theme = self.theme
-        
+
         self.log("🔄", "Loading details...")
-        
-        details = await self._load_with_retry("Loading details", scraper.get_show_details, show["url"],
-                                              empty_message="Show details unavailable.")
+
+        with Progress(
+            SpinnerColumn("arc"),
+            TextColumn("[progress.description]{task.description}"),
+            console=CONSOLE,
+            transient=True
+        ) as progress:
+            progress.add_task(f"[{theme['primary']}]Fetching info...", total=None)
+            details = await asyncio.to_thread(scraper.get_show_details, show['url'])
+
         if not details:
+            self.log("✗", "Failed to load details", theme['error'])
+            await asyncio.sleep(2)
             return NavigationOutcome.BACK
 
+        self.current_show_url = details.get('url') or show.get('url')
         self._display_show_overview(details)
-        if getattr(self, "current_show_url", None) != show["url"]:
-            self.current_season = None
-            self.current_episodes = []
-            self.current_episode_index = 0
-        self.current_show_url = show["url"]
+
         show_type = details.get('type')
         if show_type == 'movie':
             return await self.handle_movie(details)
-        else:
-            return await self.handle_series(details)
-    
+        return await self.handle_series(details)
+
     async def handle_movie(self, details):
-        watch_item = {'title': details.get('title'), 'show_title': self.current_show_title,
-                      'show_url': details.get('url') or getattr(self, 'current_show_url', None),
-                      'url': details.get('url') or getattr(self, 'current_show_url', None),
-                      'content_type': 'movie'}
+        watch_item = {
+            'title': details.get('title'),
+            'show_title': self.current_show_title,
+            'show_url': details.get('url') or getattr(self, 'current_show_url', None),
+            'url': details.get('url') or getattr(self, 'current_show_url', None),
+            'content_type': 'movie',
+        }
         saved = getattr(self, 'watch_later', None) and self.watch_later.contains(watch_item)
-        action = self.run_fzf(["Play", "Download",
-                               "Remove from Watch Later" if saved else "Add to Watch Later", "Back"],
-                              title=self.current_show_title)
+        action = self.run_fzf(
+            [
+                "Play",
+                "Download",
+                "Remove from Watch Later" if saved else "Add to Watch Later",
+                "Back",
+            ],
+            title=self.current_show_title,
+        )
         if action in (None, 3):
             return NavigationOutcome.BACK
         if action == 1:
@@ -1061,18 +1312,19 @@ class CinemaCLI:
             else:
                 self.watch_later.add(watch_item)
             return NavigationOutcome.BACK
+
         servers = details.get('servers', [])
-        
         if not servers:
             servers = await self._load_with_retry(
                 "Loading servers", scraper.fetch_episode_servers, details,
-                empty_message="No streaming servers available for this movie.")
+                empty_message="No streaming servers available for this movie.",
+            )
             if not servers:
                 return NavigationOutcome.BACK
-        
+
         while True:
             try:
-                result = await self.select_and_play(servers, self.current_show_title)
+                result = await self.select_and_play(servers, self.current_show_title or clean_show_title(details.get('title', '')))
             except Exception as exc:
                 self.log("⚠", escape(f"Playback failed: {exc}"), self.theme["error"])
                 result = PlaybackOutcome.FAILED
@@ -1080,14 +1332,14 @@ class CinemaCLI:
                 return NavigationOutcome.BACK
             if self.run_fzf(["Retry playback", "Back"], title="Playback unavailable") != 0:
                 return NavigationOutcome.BACK
-    
+
     def _episode_sort_key(self, episode):
         num = episode.get('episode_number') or episode.get('display_number')
         try:
             return float(str(num).strip())
         except Exception:
             return float('inf')
-    
+
     def _normalize_episode_number(self, value):
         if value is None:
             return "?"
@@ -1098,12 +1350,11 @@ class CinemaCLI:
             return str(num).rstrip('0').rstrip('.')
         except Exception:
             return str(value).strip() or "?"
-    
+
     def _clean_episode_title(self, title, num_label):
         if not title:
             return ""
         t = title.strip()
-        # Clean quality, resolution, ratings, and common metadata tags
         junk_patterns = [
             r'\b(?:1080p|720p|480p|360p)\b',
             r'\b(?:WEB-DL|BluRay|HDTV|CAM)\b',
@@ -1127,34 +1378,85 @@ class CinemaCLI:
         if hasattr(self, 'current_show_title') and self.current_show_title:
             t = re.sub(re.escape(self.current_show_title), '', t, flags=re.IGNORECASE)
         return t.strip(' .-_:')
-    
+
     def _format_episode_label(self, episode):
         num_raw = episode.get('display_number') or episode.get('episode_number')
         num_label = self._normalize_episode_number(num_raw)
-        
+
         season_num = self.current_season.get('season_number') if self.current_season else None
         prog = self.history.get_progress(
-            self.current_show_title, season_num,
-            self._normalize_episode_number(episode.get('episode_number') or episode.get('display_number')),
+            self.current_show_title,
+            season_num,
+            num_label,
             show_url=getattr(self, "current_show_url", None),
-            season_part=(self.current_season or {}).get("season_part"))
+            season_part=(self.current_season or {}).get("season_part"),
+        )
 
-        status = "Unwatched"
-        progress = "—"
+        badge = "📺"
+        status_str = ""
         if prog:
-            status = "Watched" if prog.status == WatchStatus.COMPLETED else "Continue"
-            progress = f"{int(prog.progress_pct)}% · {format_seconds(prog.time_pos)}"
-        return PickerRow((f"Episode {num_label}", progress, status), ("Episode", "Progress", "Status"))
+            if prog.status == WatchStatus.COMPLETED or prog.progress_pct >= 85.0:
+                badge = "👁️ "
+                status_str = " [green][Watched][/]"
+            elif prog.status == WatchStatus.IN_PROGRESS and prog.progress_pct > 0:
+                badge = "⏳"
+                pos_fmt = format_seconds(prog.time_pos)
+                status_str = f" [yellow][{int(prog.progress_pct)}% · {pos_fmt}][/]"
+
+        if str(num_label).lower().startswith(("episode", "ep")):
+            ep_text = num_label
+        elif str(num_label).replace('.', '', 1).isdigit():
+            ep_text = f"Episode {num_label}"
+        else:
+            ep_text = str(num_label)
+
+        return f"{badge} {ep_text}{status_str}"
 
     def _display_show_overview(self, details):
         title = clean_show_title(details.get("title", ""))
         if not title:
             title = details.get("title", "Untitled")
-        
+
         self.current_show_title = title
-        self._details = details
-        self._set_breadcrumbs()
-        self.current_overview_panel = details_card(details, title, CONSOLE.width, self.theme)
+        theme = self.theme
+
+        metadata = details.get('metadata', {}) or {}
+        year = metadata.get('year') or details.get('year')
+        rating = metadata.get('rating') or metadata.get('imdb_rating')
+        show_type = details.get('type', 'unknown').title()
+        quality = metadata.get('quality')
+        seasons = len(details.get('seasons', [])) if details.get('seasons') else None
+
+        type_emoji = "🎬" if show_type.lower() == 'movie' else "📺" if show_type.lower() == 'series' else "🎌"
+
+        parts = [f"[bold {theme['primary']}]{escape(title)}[/bold {theme['primary']}]"]
+
+        if year and str(year).lower() not in ('unknown', 'n/a'):
+            parts.append(f"📅 {year}")
+
+        if rating:
+            parts.append(f"[#daa520]⭐ {rating}[/#daa520]")
+
+        if quality:
+            parts.append(f"📀 {quality}")
+
+        parts.append(f"{type_emoji} {show_type}")
+
+        if seasons is not None and show_type.lower() != "movie":
+            parts.append(f"📂 {seasons} Seasons")
+
+        info = " • ".join(parts)
+        CONSOLE.print(info)
+
+        description = (details.get('description') or details.get('story') or "").strip()
+        if description:
+            CONSOLE.print(Text(description[:200] + "..." if len(description) > 200 else description, style="dim"))
+        CONSOLE.print("")
+
+        self.current_overview_panel = Group(
+            Text.from_markup(info),
+            Text(description[:200] + "..." if len(description) > 200 else description, style="dim") if description else Text("")
+        )
 
     async def _load_with_retry(self, label, operation, *args, empty_message=None):
         """Retry a recoverable operation without losing the current screen."""
@@ -1162,39 +1464,43 @@ class CinemaCLI:
             error = None
             try:
                 self.banner()
-                with CONSOLE.status(Text(label + " …", style=theme_tokens(self.theme)["primary"]), spinner="dots"):
+                with CONSOLE.status(Text(label + " …", style=self.theme.get("primary", "cyan")), spinner="dots"):
                     result = await asyncio.to_thread(operation, *args)
                 if result:
                     return result
             except Exception as exc:
                 error = str(exc)
             message = f"{label}: {error}" if error else (empty_message or "Nothing available.")
-            notice = callout("CONNECTION FAILED" if error else "NOTHING HERE YET", message,
-                             "error" if error else "warning", self.theme)
-            if self.run_fzf(["Retry", "Back"], title=label, notice=notice,
+            if self.run_fzf(["Retry", "Back"], title=label, subtitle=message,
                             header="Retry this step or return to the previous screen") != 0:
                 return None
 
     async def handle_series(self, details):
-        self._set_breadcrumbs()
         seasons = details.get("seasons", [])
         if not seasons:
             self.run_fzf(["Back"], title="No seasons available")
             return NavigationOutcome.BACK
+
         season_index = 0
         while True:
-            self._set_breadcrumbs()
             if len(seasons) == 1:
                 selected = seasons[0]
             else:
+                def fmt_season(s):
+                    return s.get("display_label") or f"Season {s.get('season_number', '?')}"
+
                 selected = self.run_fzf_objects(
-                    seasons, lambda season: escape(season.get("display_label") or
-                        f"Season {season.get('season_number', '?')}"),
-                    title=escape(self.current_show_title), header="Select a season · Esc / b: back",
-                    initial_index=season_index)
+                    seasons,
+                    fmt_season,
+                    prompt="📂 Season ❯ ",
+                    title=escape(self.current_show_title),
+                    header="Select a season · Esc: back",
+                    initial_index=season_index,
+                )
                 if selected is None:
                     return NavigationOutcome.BACK
                 season_index = seasons.index(selected)
+
             outcome = await self.handle_season_episodes(selected, seasons)
             if outcome == NavigationOutcome.SEARCH:
                 return outcome
@@ -1203,12 +1509,13 @@ class CinemaCLI:
 
     async def handle_season_episodes(self, selected_season, all_seasons=None):
         season_label = selected_season.get("display_label") or f"Season {selected_season.get('season_number', '?')}"
-        self._set_breadcrumbs(season_label)
         episodes = await self._load_with_retry(
             "Loading episodes", scraper.fetch_season_episodes, selected_season,
-            empty_message=f"No episodes available for {season_label}.")
+            empty_message=f"No episodes available for {season_label}.",
+        )
         if not episodes:
             return NavigationOutcome.BACK
+
         episodes = sorted(episodes, key=self._episode_sort_key)
         previous_url = None
         if self.current_season and self.current_season.get("url") == selected_season.get("url") and self.current_episodes:
@@ -1216,29 +1523,40 @@ class CinemaCLI:
         self.current_season = selected_season
         self.current_episodes = episodes
         self.current_episode_index = next(
-            (i for i, episode in enumerate(episodes) if episode.get("url") == previous_url), 0)
+            (i for i, episode in enumerate(episodes) if episode.get("url") == previous_url), 0
+        )
+
         while True:
-            self._set_breadcrumbs(season_label)
-            action = self.run_fzf(["Play an episode", "Download episodes", "Back"],
-                                  title=season_label)
+            action = self.run_fzf(
+                ["Play an episode", "Download episodes", "Back"],
+                title=season_label,
+            )
             if action in (None, 2):
                 return NavigationOutcome.BACK
             if action == 1:
-                self.banner()
-                chosen = RichPicker(CONSOLE, self.theme,
-                    breadcrumbs=getattr(self, "_breadcrumbs", ["Home"])).pick_many(
-                        episodes, self._format_episode_label, title="Download episodes",
-                        subtitle="Tab toggles an episode · Enter reviews selection · Esc / b back")
+                formatted = [self._format_episode_label(ep) for ep in episodes]
+                chosen = self.run_fzf(
+                    formatted,
+                    prompt="⬇️ Download ❯ ",
+                    title="Download episodes",
+                    subtitle="Tab toggles an episode (in fzf) · Enter confirms · Esc back",
+                    multi=True,
+                )
                 if chosen:
                     await self.download_items([episodes[i] for i in chosen], selected_season)
                 continue
+
             selected = self.run_fzf_objects(
-                episodes, self._format_episode_label,
+                episodes,
+                self._format_episode_label,
+                prompt="🎬 Episode ❯ ",
                 title=escape(f"{self.current_show_title} — {season_label}"),
-                header=f"{len(episodes)} episodes · Esc / b: back",
-                initial_index=self.current_episode_index)
+                header=f"{len(episodes)} episodes · Esc: back",
+                initial_index=self.current_episode_index,
+            )
             if selected is None:
                 return NavigationOutcome.BACK
+
             self.current_episode_index = episodes.index(selected)
             while True:
                 episode = episodes[self.current_episode_index]
@@ -1255,20 +1573,26 @@ class CinemaCLI:
     async def play_episode(self, episode, season_label):
         episode_num = self._normalize_episode_number(episode.get("episode_number") or episode.get("display_number"))
         episode_title = self._clean_episode_title(episode.get("title", ""), episode_num)
-        self._set_breadcrumbs(season_label, f"Episode {episode_num}")
         self.banner()
         self._print_focus_panel(self.current_show_title, f"{season_label} · Episode {episode_num}")
+
         servers = await self._load_with_retry(
             "Loading servers", scraper.fetch_episode_servers, episode,
-            empty_message="No streaming servers available for this episode.")
+            empty_message="No streaming servers available for this episode.",
+        )
         if not servers:
             return PlaybackOutcome.CANCELLED
+
         while True:
             try:
                 result = await self.select_and_play(
-                    servers, f"{season_label} · Episode {episode_num}", is_episode=True,
+                    servers,
+                    f"{season_label} · Episode {episode_num}",
+                    is_episode=True,
                     season_num=self.current_season.get("season_number"),
-                    ep_num=episode_num, ep_title=episode_title)
+                    ep_num=episode_num,
+                    ep_title=episode_title,
+                )
             except Exception as exc:
                 self.log("⚠", escape(f"Playback failed: {exc}"), self.theme["error"])
                 result = PlaybackOutcome.FAILED
@@ -1283,45 +1607,48 @@ class CinemaCLI:
         try:
             check_download_tools()
         except RuntimeError as exc:
-            self.run_fzf(["Back"], title="Download tools required",
-                         notice=callout("SETUP", str(exc), "warning", self.theme))
+            self.run_fzf(["Back"], title="Download tools required", subtitle=str(exc))
             return
-        directory = self.config.download_dir
-        labels = ["Episode " + self._normalize_episode_number(
-            item.get("episode_number") or item.get("display_number"))
-            if season else self.current_show_title for item in items]
-        manager_keys = list(detected_managers())
-        selected_manager = self.run_fzf(download_engine_labels(manager_keys) + ['Back'],
-            title='How should downloads run?',
-            subtitle='Choose the downloader. The app keeps retry and cancellation handling.')
-        if selected_manager is None or selected_manager >= len(manager_keys):
-            return
-        manager = manager_keys[selected_manager]
-        if self.run_fzf(["Queue in background", "Back"], title=f"Download {len(items)} item(s)?",
-                        subtitle=f"Save to {directory} · " + ", ".join(labels)) != 0:
-            return
-        for item, label in zip(items, labels):
-            number = self._normalize_episode_number(item.get('episode_number') or item.get('display_number')) if season else None
-            title = media_title(self.current_show_title, (season or {}).get('season_number'), number,
-                                (season or {}).get('season_part'))
+
+        managers = list(detected_managers())
+        manager = managers[0]
+        if len(managers) > 1:
+            choice = self.run_fzf(download_engine_labels(managers), title='Download engine')
+            if choice is None:
+                return
+            manager = managers[choice]
+
+        directory = str(Path(getattr(self.config, 'download_dir', None) or (Path.home() / 'Downloads' / 'cenima-cli')).expanduser())
+        for item in items:
+            ep_num = self._normalize_episode_number(item.get('episode_number') or item.get('display_number')) if season else None
+            title = media_title(
+                self.current_show_title,
+                (season or {}).get('season_number'),
+                ep_num,
+                (season or {}).get('season_part'),
+            )
             self.media_store.enqueue({
-                'catalog_url': item['url'], 'show_url': getattr(self, 'current_show_url', None) or item['url'],
-                'show_title': self.current_show_title, 'download_title': title,
+                'catalog_url': item['url'],
+                'show_url': getattr(self, 'current_show_url', None) or item.get('url'),
+                'show_title': self.current_show_title,
+                'download_title': title,
                 'content_type': 'series' if season else 'movie',
                 'season_number': (season or {}).get('season_number'),
                 'season_part': (season or {}).get('season_part'),
                 'season_label': (season or {}).get('display_label'),
-                'episode_number': self._normalize_episode_number(item.get('episode_number') or item.get('display_number')) if season else None,
+                'episode_number': ep_num,
                 'episode_title': item.get('title') if season else None,
                 'manager': manager,
-                'quality': (self.config.download_quality if isinstance(getattr(self.config, 'download_quality', None), str)
-                            else 'best'),
-                'speed': (self.config.download_speed if isinstance(getattr(self.config, 'download_speed', None), str)
-                          else 'unlimited'),
+                'quality': (self.config.download_quality if isinstance(getattr(self.config, 'download_quality', None), str) else 'best'),
+                'speed': (self.config.download_speed if isinstance(getattr(self.config, 'download_speed', None), str) else 'unlimited'),
             }, directory)
+
         self.download_worker.start()
-        choice = self.run_fzf(['Keep browsing', 'Open Downloads'], title='Queued in background',
-                     subtitle='/downloads shows live progress, retry and cancel controls')
+        choice = self.run_fzf(
+            ['Keep browsing', 'Open Downloads'],
+            title='Queued in background',
+            subtitle='/downloads shows live progress, retry and cancel controls',
+        )
         if choice == 1:
             await self.show_download_queue()
 
@@ -1330,7 +1657,7 @@ class CinemaCLI:
 
     async def select_and_play(self, servers, title_context, is_episode=False, season_num=None, ep_num=None, ep_title=None):
         theme = self.theme
-        
+
         if not servers:
             self.log("✗", "No servers available", theme['error'])
             await asyncio.sleep(1)
@@ -1338,7 +1665,6 @@ class CinemaCLI:
 
         primary_color = theme.get('primary', 'cyan')
 
-        # Fast-track VidTube server directly (skip expensive multi-server health probing)
         def is_vidtube_server(s):
             url_str = str(s.get('embed_url') or '').lower()
             name_str = str(s.get('name') or '').lower()
@@ -1380,8 +1706,6 @@ class CinemaCLI:
                     content_type="series" if is_episode else "movie"
                 )
 
-
-        # Fallback: probe servers if VidTube is unavailable or extraction failed
         checker = ServerHealthChecker(referer=scraper.base_url)
         loop = asyncio.get_running_loop()
 
@@ -1396,11 +1720,9 @@ class CinemaCLI:
             ptask = progress.add_task(f"[{primary_color}]Checking servers...", total=len(servers))
 
             def advance():
-                # Called from the probe worker thread; progress lives on the loop.
                 loop.call_soon_threadsafe(progress.advance, ptask, 1)
 
             servers = await asyncio.to_thread(checker.probe_all, servers, 16, advance)
-            # Let the queued progress callbacks drain while the bar still exists.
             await asyncio.sleep(0)
 
         total_servers = len(servers)
@@ -1408,12 +1730,16 @@ class CinemaCLI:
         slow_count = sum(1 for s in servers if s.get("health") == SLOW)
 
         if total_servers == 1 and live_count == 1:
-            # Nothing to choose between and we already know it works.
             selected_server = servers[0]
         else:
-            def fmt_server(server):
-                status = {LIVE: "Ready", SLOW: "Slow", OFFLINE: "Offline"}.get(server.get('health'), "Unknown")
-                return PickerRow((str(server.get('name') or 'Server'), status), ("Server", "Status"))
+            def fmt_server(s):
+                name = escape(str(s.get('name') or 'Server'))
+                health = s.get('health', OFFLINE)
+                if health == LIVE:
+                    return f"[green]🟢[/] [green]Online [/] {name}"
+                if health == SLOW:
+                    return f"[yellow]🟡[/] [yellow]Slow   [/] {name}"
+                return f"[red]🔴[/] [dim red]Offline[/] {name}"
 
             summary = []
             if live_count:
@@ -1428,16 +1754,16 @@ class CinemaCLI:
                 servers,
                 fmt_server,
                 prompt="📡 Server ❯ ",
-                title="Streaming servers",
+                title="📡 Select Streaming Server",
                 subtitle=subtitle,
                 header=None
             )
         if not selected_server:
             return PlaybackOutcome.CANCELLED
-        
+
         video_url = selected_server.get('video_url')
         srv_url = selected_server.get('embed_url') or scraper.base_url
-        
+
         if not video_url:
             name = selected_server.get('name', 'Server')
             if selected_server.get('health') == OFFLINE:
@@ -1453,12 +1779,12 @@ class CinemaCLI:
                 progress.add_task(f"[{primary_color}]Extracting stream...", total=None)
                 proc = ServerProcessor()
                 video_url = await asyncio.to_thread(proc.extract, srv_url, scraper.base_url)
-        
+
         if not video_url:
             self.log("✗", f"Server offline: {selected_server.get('name')}", theme['error'])
+            await asyncio.sleep(2)
             return PlaybackOutcome.FAILED
 
-        # Determine the correct referer for mpv anti-hotlink headers
         if hasattr(video_url, "referer") and video_url.referer:
             referer = video_url.referer
         elif any(k in str(video_url).lower() for k in ["cdn-video", "serv-stream", "vidtube"]):
@@ -1469,10 +1795,10 @@ class CinemaCLI:
             referer = "https://uqload.net/"
         else:
             referer = srv_url
-        
+
         self.log("▶️", f"Launching player with {selected_server.get('name')}...")
         await asyncio.sleep(0.3)
-        
+
         return self.play_video(
             video_url,
             referer=referer,
@@ -1482,18 +1808,22 @@ class CinemaCLI:
             ep_title=ep_title,
             content_type="series" if is_episode else "movie"
         )
-        
-    
+
     async def prompt_next_episode(self):
         has_next = self.current_episode_index + 1 < len(self.current_episodes)
         options = (["Play Next Episode"] if has_next else []) + ["Back to Episodes", "Back to Search"]
-        choice = self.run_fzf(options, title="Playback finished" if has_next else "End of season",
-                              header="Esc / b: back to episodes")
+        choice = self.run_fzf(
+            options,
+            title="Playback finished" if has_next else "End of season",
+            header="Esc: back to episodes",
+        )
         if choice is None:
             return NavigationOutcome.EPISODES
-        return {"Play Next Episode": NavigationOutcome.NEXT,
-                "Back to Search": NavigationOutcome.SEARCH,
-                "Back to Episodes": NavigationOutcome.EPISODES}[options[choice]]
+        return {
+            "Play Next Episode": NavigationOutcome.NEXT,
+            "Back to Search": NavigationOutcome.SEARCH,
+            "Back to Episodes": NavigationOutcome.EPISODES,
+        }[options[choice]]
 
     def _build_mpv_command(self, url, referer=None, title=None, sock=None):
         cmd = ["mpv"]
@@ -1527,8 +1857,12 @@ class CinemaCLI:
         theme = self.theme
         season = (self.current_season or {}) if ep_num is not None else {}
         prog = self.history.get_progress(
-            self.current_show_title, season_num, ep_num,
-            show_url=getattr(self, "current_show_url", None), season_part=season.get("season_part"))
+            self.current_show_title,
+            season_num,
+            ep_num,
+            show_url=getattr(self, "current_show_url", None),
+            season_part=season.get("season_part"),
+        )
         start_time = 0.0
 
         if prog and prog.time_pos > 10.0 and prog.status != WatchStatus.COMPLETED:
@@ -1558,7 +1892,7 @@ class CinemaCLI:
             title=title or self.current_show_title or "cenima-cli",
             start_time=start_time,
             referer=referer,
-            subtitle_language=self.config.subtitle_language,
+            subtitle_language=getattr(self.config, "subtitle_language", "ar"),
         )
 
         if mpv_state and mpv_state.time_pos and mpv_state.time_pos > 5:
@@ -1573,8 +1907,11 @@ class CinemaCLI:
                 show_url=getattr(self, "current_show_url", None),
                 season_label=season.get("display_label"),
                 season_part=season.get("season_part"),
-                episode_url=(self.current_episodes[self.current_episode_index].get("url")
-                             if ep_num is not None and self.current_episodes else None)
+                episode_url=(
+                    self.current_episodes[self.current_episode_index].get("url")
+                    if ep_num is not None and self.current_episodes
+                    else None
+                ),
             )
             if saved_prog.status == WatchStatus.COMPLETED:
                 self.log("👁️", f"Marked as Watched ({int(saved_prog.progress_pct)}%)", f"bold {theme['primary']}")
@@ -1590,7 +1927,6 @@ class CinemaCLI:
         else:
             self.log("⚠️", f"MPV exited with code {rc}", theme["error"])
             return PlaybackOutcome.FAILED
-
 
 
 def main(argv=None):
@@ -1624,12 +1960,10 @@ def main(argv=None):
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             parser.error(str(exc))
         return
-    # The entire session owns the alternate buffer. Individual pickers must not
-    # switch buffers and restore an obsolete screen when a selection is made.
+
     with CONSOLE.screen() if CONSOLE.is_terminal else nullcontext():
         cli = CinemaCLI()
-        cli.no_animation = bool(args.no_animation or
-                                os.environ.get('CINEMA_REDUCED_MOTION') == '1')
+        cli.no_animation = bool(args.no_animation or os.environ.get('CINEMA_REDUCED_MOTION') == '1')
         try:
             asyncio.run(cli.search_flow())
         except KeyboardInterrupt:

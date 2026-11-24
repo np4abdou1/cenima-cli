@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import warnings
@@ -14,6 +15,8 @@ from typing import Dict, List, Optional, Tuple
 
 from .config import HISTORY_FILE, COMPLETED_THRESHOLD
 from .models import WatchProgress, WatchStatus, content_identity, canonical_content_url
+
+logger = logging.getLogger(__name__)
 
 
 class HistoryManager:
@@ -134,6 +137,7 @@ class HistoryManager:
             with self._transaction():
                 pass
         except (OSError, ValueError) as exc:
+            logger.warning("Failed to load watch history from %s: %s", self.history_file, exc)
             warnings.warn(f"Could not read watch history: {exc}", RuntimeWarning)
 
     def save(self) -> None:
@@ -163,8 +167,8 @@ class HistoryManager:
             if data:
                 try:
                     return WatchProgress(**data)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Skipping invalid history entry %s: %s", key, exc)
         return None
 
     def update_progress(
@@ -269,12 +273,16 @@ class HistoryManager:
 
     def get_recent_history(self, limit: int = 20) -> List[WatchProgress]:
         items: List[WatchProgress] = []
-        with self._transaction():
-            for key, data in self._history.items():
-                try:
-                    items.append(WatchProgress(**data))
-                except Exception:
-                    pass
+        try:
+            with self._transaction():
+                for key, data in self._history.items():
+                    try:
+                        items.append(WatchProgress(**data))
+                    except Exception as exc:
+                        logger.debug("Skipping invalid history entry %s: %s", key, exc)
+        except (OSError, ValueError) as exc:
+            logger.warning("Failed to read watch history from %s: %s", self.history_file, exc)
+            return []
         items.sort(key=lambda x: x.last_watched, reverse=True)
         return items[:limit]
 

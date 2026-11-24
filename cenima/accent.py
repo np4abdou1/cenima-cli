@@ -4,6 +4,7 @@ import json
 import configparser
 import subprocess
 import colorsys
+from functools import lru_cache
 from typing import Dict, Tuple, Optional
 
 def hex_to_rgb(hex_str: str) -> Tuple[int, int, int]:
@@ -25,6 +26,7 @@ def adjust_brightness(hex_str: str, factor: float) -> str:
     nr, ng, nb = colorsys.hls_to_rgb(h, new_l, s)
     return rgb_to_hex((int(nr * 255), int(ng * 255), int(nb * 255)))
 
+@lru_cache(maxsize=1)
 def detect_system_accent() -> Tuple[str, str]:
     """Detects system accent color across KDE, GNOME, Omarchy, Pywal, Matugen, GTK, etc.
     Returns tuple of (source_name, hex_color)."""
@@ -132,8 +134,10 @@ def detect_system_accent() -> Tuple[str, str]:
     # Default Fallback (Cyan accent)
     return ("Default", "#7ebfbf")
 
-def get_auto_theme() -> Dict[str, str]:
+def get_auto_theme(refresh: bool = False) -> Dict[str, str]:
     """Generates a complete theme dictionary dynamically based on detected desktop accent color."""
+    if refresh:
+        detect_system_accent.cache_clear()
     source, hex_color = detect_system_accent()
     secondary = adjust_brightness(hex_color, 1.2)
     accent = adjust_brightness(hex_color, 0.8)

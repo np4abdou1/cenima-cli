@@ -85,3 +85,5 @@ archive/
 *.rej
 /.idea/
 /docs/assets/*.png
+codebase_dump.txt
+execution_report.md

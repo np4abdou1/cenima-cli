@@ -1,8 +1,10 @@
+import logging
 import re
-import math
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from curl_cffi import requests
+
+logger = logging.getLogger(__name__)
 
 class StreamURL(str):
     """String subclass that preserves stream-specific headers and referer."""
@@ -142,6 +144,7 @@ class ServerProcessor:
                 return None
             html2 = resp.text
         except Exception as exc:
+            logger.debug("VidTube Pro fetch failed for %s: %s", next_url, exc)
             self.last_error = f'{type(exc).__name__}: {exc}'
             return None
         
@@ -242,6 +245,7 @@ class ServerProcessor:
                         
             return None
         except Exception as exc:
+            logger.debug("XFileSharing extraction failed for %s: %s", url, exc)
             self.last_error = f'{type(exc).__name__}: {exc}'
             return None
 
@@ -266,6 +270,7 @@ class ServerProcessor:
                     if unpacked:
                         return unpacked
             except Exception as exc:
+                logger.debug("Embed extraction failed for %s: %s", url, exc)
                 self.last_error = f'{type(exc).__name__}: {exc}'
                 pass
 
@@ -290,6 +295,7 @@ class ServerProcessor:
                             if direct_url:
                                 return direct_url
                     except Exception as exc:
+                        logger.debug("VidTube download page failed for %s: %s", dl_url, exc)
                         self.last_error = f'{type(exc).__name__}: {exc}'
                         continue
 
@@ -300,6 +306,7 @@ class ServerProcessor:
                     if pro_url: return pro_url
                     return self._handle_vidtube_one(resp.text, referer=url)
             except Exception as exc:
+                logger.debug("VidTube fallback extraction failed for %s: %s", url, exc)
                 self.last_error = f'{type(exc).__name__}: {exc}'
                 pass
 
