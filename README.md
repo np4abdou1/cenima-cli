@@ -1,12 +1,11 @@
-# CINEMA CLI
+# cenima-cli
 
-**Browse movies and TV shows, play with mpv, and download safely from your terminal.**
+**Browse movies, series, and anime, play with mpv + fzf, and download safely from your terminal.**
 
 An interactive Python CLI for catalog discovery, playback, managed downloads,
 resume progress, and Arabic-friendly terminal use.
 
 <p>
-  <a href="https://github.com/np4abdou1/cenima-cli/actions"><img src="https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=github-actions&logoColor=white" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-only-blue" alt="License"></a>
   <img src="https://img.shields.io/badge/python-3.9+-3776AB?logo=python&logoColor=white" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platforms">
@@ -18,25 +17,12 @@ Collaborator: [Abdelilah Elgallati](https://github.com/AbdelilahElgallati)
 ## Preview
 
 <p align="center">
-  <picture>
-    <source media="(max-width: 900px)" srcset="docs/assets/landing-80.svg">
-    <img src="docs/assets/landing-160.svg" alt="cenima-cli welcome screen" width="100%">
-  </picture>
+  <img src="docs/assets/preview.jpg" alt="cenima-cli welcome screen" width="100%">
 </p>
-
-<p align="center">
-  <picture>
-    <source media="(max-width: 900px)" srcset="docs/assets/results-80.svg">
-    <img src="docs/assets/results-160.svg" alt="cenima-cli search results" width="100%">
-  </picture>
-</p>
-
-The screenshots are generated offline from fixture data by
-`python tests/preview_ui.py`.
 
 ## Highlights
 
-- Rich terminal interface with alternate-buffer navigation
+- Classic ASCII art welcome screen with native `fzf` picker (and `RichPicker` fallback)
 - Movies, seasons, episodes, and latest-added catalogs
 - Resume watching and recent watch history
 - Managed offline library and Watch Later
@@ -124,8 +110,8 @@ returns while in a menu. Inside text fields, `b` remains ordinary text.
 | Command | Shortcut | Purpose |
 | --- | --- | --- |
 | `/history` | `/h` | Recent watch history |
-| `/continue` | `/c`, `Ctrl+R` | Continue watching |
-| `/library` | `/l`, `Ctrl+L` | Browse managed downloads |
+| `/continue` | `/c` | Continue watching |
+| `/library` | `/l` | Browse managed downloads |
 | `/downloads` | `/d` | Queue, retry, cancel |
 | `/watch-later` | `/wl` | Saved titles |
 | `/last-eps` | `/le` | Latest episode additions |
@@ -189,9 +175,6 @@ Live provider checks are opt-in and are not part of the default unit suite.
 Keep `tests/` and useful `tools/` in source control. Generated caches, virtual
 environments, build output, wheels, egg metadata, logs, local database files,
 and downloaded qualification media are not pull-request source.
-
-CI runs unit/integration tests and packaging checks across Windows, Linux,
-macOS, and Python 3.9–3.12.
 
 ## License
 
