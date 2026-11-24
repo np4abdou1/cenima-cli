@@ -21,6 +21,7 @@ class ServerProcessor:
     """Universal multi-server video extractor supporting VidTube, UpDown, Mdiaload, BowFile, Ddownload, 1CloudFile, etc."""
     
     def __init__(self, session=None, referer=None):
+        self.last_error = ""
         self.session = session or requests.Session(impersonate="chrome120")
         self.headers = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -131,6 +132,7 @@ class ServerProcessor:
                     break
         
         if not next_path:
+            self.last_error = 'No supported download quality link was present on the server page.'
             return None
             
         next_url = urljoin(target_url, next_path)
@@ -138,10 +140,12 @@ class ServerProcessor:
         try:
             resp = self.session.get(next_url, headers=req_headers, timeout=10)
             if resp.status_code != 200:
+                self.last_error = f'HTTP {resp.status_code} while resolving download quality.'
                 return None
             html2 = resp.text
         except Exception as exc:
             logger.debug("VidTube Pro fetch failed for %s: %s", next_url, exc)
+            self.last_error = f'{type(exc).__name__}: {exc}'
             return None
         
         soup2 = BeautifulSoup(html2, "html.parser")
@@ -165,6 +169,7 @@ class ServerProcessor:
             direct = urljoin(next_url, match.group(1))
             return StreamURL(direct, referer=next_url or "https://down.vidtube.one/", headers=vid_headers)
             
+        self.last_error = 'The download page did not contain a direct media link.'
         return None
 
     def extract_xfilesharing(self, url: str, referer: str = None) -> str:
@@ -183,7 +188,10 @@ class ServerProcessor:
             form1 = soup1.find('form')
             if not form1:
                 for a in soup1.find_all('a', href=True):
-                    if '.mp4' in a['href']: return a['href']
+                    if '.mp4' in a['href']:
+                        direct = urljoin(str(resp1.url or url), a['href'])
+                        if urlparse(direct).scheme in ('http', 'https'):
+                            return StreamURL(direct, referer=url, headers={'Referer': url, 'User-Agent': headers['User-Agent']})
                 return None
                 
             data1 = {inp.get('name'): inp.get('value', '') for inp in form1.find_all('input') if inp.get('name')}
@@ -197,7 +205,10 @@ class ServerProcessor:
             form2 = soup2.find('form')
             if not form2:
                 for a in soup2.find_all('a', href=True):
-                    if '.mp4' in a['href']: return a['href']
+                    if '.mp4' in a['href']:
+                        direct = urljoin(str(resp2.url or url), a['href'])
+                        if urlparse(direct).scheme in ('http', 'https'):
+                            return StreamURL(direct, referer=url, headers={'Referer': url, 'User-Agent': headers['User-Agent']})
                 return None
                 
             data2 = {inp.get('name'): inp.get('value', '') for inp in form2.find_all('input') if inp.get('name')}
@@ -214,14 +225,19 @@ class ServerProcessor:
             resp3 = self.session.post(url, data=data2, headers=headers, allow_redirects=False, timeout=10)
             
             if resp3.status_code in (301, 302, 303, 307) and 'Location' in resp3.headers:
-                loc = resp3.headers['Location']
-                return StreamURL(loc, referer=ref_host, headers=x_headers)
+                loc = urljoin(str(resp3.url or url), resp3.headers['Location'])
+                if urlparse(loc).scheme in ('http', 'https'):
+                    return StreamURL(loc, referer=ref_host, headers=x_headers)
+                self.last_error = 'Server redirected to an unsupported URL scheme.'
+                return None
                 
             if resp3.status_code == 200:
                 soup3 = BeautifulSoup(resp3.text, 'html.parser')
                 for a in soup3.find_all('a', href=True):
                     if '.mp4' in a['href'] or 'gamescdn' in a['href']:
-                        return StreamURL(a['href'], referer=ref_host, headers=x_headers)
+                        direct = urljoin(str(resp3.url or url), a['href'])
+                        if urlparse(direct).scheme in ('http', 'https'):
+                            return StreamURL(direct, referer=ref_host, headers=x_headers)
                         
                 mp4_match = re.search(r"[\"'](https?://[^\"']+\.mp4[^\"']*)[\"']", resp3.text)
                 if mp4_match:
@@ -230,6 +246,7 @@ class ServerProcessor:
             return None
         except Exception as exc:
             logger.debug("XFileSharing extraction failed for %s: %s", url, exc)
+            self.last_error = f'{type(exc).__name__}: {exc}'
             return None
 
     def extract(self, url: str, referer: str = None) -> str:
@@ -254,6 +271,7 @@ class ServerProcessor:
                         return unpacked
             except Exception as exc:
                 logger.debug("Embed extraction failed for %s: %s", url, exc)
+                self.last_error = f'{type(exc).__name__}: {exc}'
                 pass
 
         # UpDown, Mdiaload, BowFile, Ddownload, 1CloudFile, Nitroflare (XFileSharing servers)
@@ -278,6 +296,7 @@ class ServerProcessor:
                                 return direct_url
                     except Exception as exc:
                         logger.debug("VidTube download page failed for %s: %s", dl_url, exc)
+                        self.last_error = f'{type(exc).__name__}: {exc}'
                         continue
 
             try:
@@ -288,6 +307,7 @@ class ServerProcessor:
                     return self._handle_vidtube_one(resp.text, referer=url)
             except Exception as exc:
                 logger.debug("VidTube fallback extraction failed for %s: %s", url, exc)
+                self.last_error = f'{type(exc).__name__}: {exc}'
                 pass
 
         # Generic XFileSharing fallback

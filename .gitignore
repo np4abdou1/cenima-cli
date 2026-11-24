@@ -76,6 +76,14 @@ Thumbs.db
 old_stuff/
 archive/
 *.html
+!tests/fixtures/*.html
+.packaging-check/
 *.log
+.codegraph/
+*.bak
+*.orig
+*.rej
+/.idea/
+/docs/assets/*.png
 codebase_dump.txt
 execution_report.md

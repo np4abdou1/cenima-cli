@@ -93,3 +93,6 @@ THEMES = {
 }
 
 DEFAULT_THEME = "auto"
+
+# --- Spinners ---
+SPINNERS = ["dots", "dots2", "dots3", "line", "star", "growVertical", "arc", "bouncingBar", "aesthetic"]

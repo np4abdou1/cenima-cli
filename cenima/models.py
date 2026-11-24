@@ -1,6 +1,45 @@
 from pydantic import BaseModel, Field, HttpUrl
 from typing import List, Optional, Dict, Any
 from enum import Enum
+import hashlib
+import json
+import re
+from urllib.parse import urlsplit, urlunsplit, unquote
+
+
+def canonical_content_url(url: str) -> str:
+    """Normalize catalog identities, including TopCinema mirror changes."""
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    if re.fullmatch(r"topcinemaa?\.[a-z]+", host):
+        return "topcinema:" + unquote(parts.path).rstrip("/") + ("?" + parts.query if parts.query else "")
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
+                       unquote(parts.path).rstrip("/"), parts.query, ""))
+
+
+def content_identity(show_url, season_number=None, episode_number=None,
+                     season_part=None, content_type="movie") -> Optional[str]:
+    """Identity uses catalog pages, never expiring CDN playback URLs."""
+    if not show_url:
+        return None
+    kind = "episode" if season_number is not None or episode_number is not None else content_type
+    values = [canonical_content_url(show_url), kind, season_number,
+              str(episode_number) if episode_number is not None else None,
+              (season_part or "").strip().casefold()]
+    return "v2:" + hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).hexdigest()
+
+
+class NavigationOutcome(str, Enum):
+    BACK = "back"
+    SEARCH = "search"
+    EPISODES = "episodes"
+    NEXT = "next"
+
+
+class PlaybackOutcome(str, Enum):
+    FINISHED = "finished"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
 
 class ContentType(str, Enum):
     MOVIE = "movie"
@@ -98,11 +137,13 @@ class WatchStatus(str, Enum):
 
 
 class WatchProgress(BaseModel):
+    content_id: Optional[str] = None
     show_title: str
     show_url: Optional[str] = None
     content_type: str = "movie"
     season_number: Optional[int] = None
     season_label: Optional[str] = None
+    season_part: Optional[str] = None
     episode_number: Optional[str] = None
     episode_title: Optional[str] = None
     episode_url: Optional[str] = None

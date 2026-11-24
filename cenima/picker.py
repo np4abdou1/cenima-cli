@@ -14,11 +14,20 @@ from rich.text import Text
 from rich.table import Table
 from rich.markup import escape, MarkupError
 
+
+class PickerAction:
+    def __init__(self, action: str, item: Any = None):
+        self.action = action
+        self.item = item
+
 @contextmanager
 def raw_terminal(fd: Optional[int] = None):
     """Safely enter and exit raw terminal mode with guaranteed restoration."""
     if fd is None:
-        fd = sys.stdin.fileno()
+        try:
+            fd = sys.stdin.fileno()
+        except Exception:
+            fd = 0
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
@@ -90,7 +99,10 @@ class RichPicker:
             q = filter_query.lower()
             return [i for i, item in enumerate(items) if q in format_func(item).lower()]
 
-        fd = sys.stdin.fileno()
+        try:
+            fd = sys.stdin.fileno()
+        except Exception:
+            fd = 0
 
         with raw_terminal(fd):
             while True:
@@ -232,11 +244,16 @@ class CustomPrompt:
         input_str = ""
         history = history or []
         hist_idx = len(history)
-        fd = sys.stdin.fileno()
+        try:
+            fd = sys.stdin.fileno()
+        except Exception:
+            fd = 0
 
         def render(show_cursor: bool):
             cursor = "█" if show_cursor else " "
-            return Text.from_markup(f"[{self.theme['primary']}]{prompt_text}[/] {input_str}{cursor}")
+            t = Text.from_markup(f"[{self.theme['primary']}]{prompt_text}[/] ")
+            t.append(f"{input_str}{cursor}")
+            return t
 
         with raw_terminal(fd):
             with Live(render(True), console=self.console, screen=False, auto_refresh=False, transient=True) as live:
