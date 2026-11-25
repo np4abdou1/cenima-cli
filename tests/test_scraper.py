@@ -92,3 +92,75 @@ def test_get_series_details_matches_series_season_links():
     assert details is not None
     assert len(details["seasons"]) == 2
     assert [s["season_number"] for s in details["seasons"]] == [1, 2]
+
+
+def test_get_servers_falls_back_to_watch_ajax():
+    scraper = _make_offline_scraper()
+    watch_html = """
+    <html><body>
+      <ul class="servers-list">
+        <li class="server--item active" data-id="999" data-server="0">VideoTube</li>
+        <li class="server--item" data-id="999" data-server="1">OkStream</li>
+      </ul>
+    </body></html>
+    """
+
+    class FakeResp:
+        def __init__(self, text, status_code=200, url="https://topcinema.film/ep/"):
+            self.text = text
+            self.status_code = status_code
+            self.url = url
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/watch/"):
+            return FakeResp(watch_html, url=url)
+        return FakeResp("<html></html>", url=url)
+
+    def fake_post(url, data=None, **kwargs):
+        idx = (data or {}).get("i")
+        if idx == "0":
+            return FakeResp('<iframe src="https://down.vidtube.one/embed-abc.html"></iframe>')
+        return FakeResp('<iframe src="https://okstream.online/embed-xyz.html"></iframe>')
+
+    scraper.session.get = fake_get
+    scraper.session.post = fake_post
+    servers = scraper.get_servers("", "https://topcinema.film/ep/")
+    assert len(servers) == 2
+    assert servers[0]["embed_url"] == "https://down.vidtube.one/embed-abc.html"
+    assert servers[1]["embed_url"] == "https://okstream.online/embed-xyz.html"
+
+
+def test_automatic_domain_failover_and_retry():
+    scraper = TopCinemaScraper(base_url="https://dead-topcinema.old", auto_discover=False)
+    calls = []
+
+    class FakeResp:
+        def __init__(self, text, status_code=200, url="https://topcinemaa.tv/"):
+            self.text = text
+            self.status_code = status_code
+            self.url = url
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        if "dead-topcinema.old" in url:
+            raise ConnectionError("DNS/connection failed")
+        if url.rstrip("/") == "https://topcinemaa.tv":
+            return FakeResp("<html><title>TopCinema</title></html>", url="https://topcinemaa.tv/")
+        if url == "https://topcinemaa.tv/series/show-1/":
+            return FakeResp("<html><h1 class='post-title'>Test</h1></html>", url=url)
+        return FakeResp("", status_code=404, url=url)
+
+    scraper.session.get = fake_get
+    scraper._save_domain_cache = lambda d: None
+    resp = scraper._request("GET", "https://dead-topcinema.old/series/show-1/")
+    assert resp.status_code == 200
+    assert scraper.base_url == "https://topcinemaa.tv"
+    assert "https://topcinemaa.tv/series/show-1/" in calls
+
+
+def test_html_meta_and_js_redirect_recognition():
+    scraper = _make_offline_scraper()
+    meta_html = '<meta http-equiv="refresh" content="0;url=https://topcinemaa.new/home">'
+    js_html = '<script>window.location.href = "https://topcinemaa.tv/";</script>'
+    assert scraper._extract_html_redirect(meta_html, "https://topcinema.film/") == "https://topcinemaa.new/home"
+    assert scraper._extract_html_redirect(js_html, "https://topcinema.film/") == "https://topcinemaa.tv/"

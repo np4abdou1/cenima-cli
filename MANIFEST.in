@@ -1,2 +1,2 @@
 recursive-include tests *.py *.html
-include requirements.txt main.py FEATURE_AUDIT.md
+include VERSION requirements.txt main.py

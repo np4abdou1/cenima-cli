@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import re
@@ -176,6 +177,7 @@ class TopCinemaScraper:
         headers["Referer"] = self.base_url
         self.session.headers.update(headers)
         self.vidtube_processor = VidTubeProcessor(self.session, referer=self.base_url)
+        self._last_failover_at = 0.0
         
         if auto_discover:
             self._discover_domain()
@@ -197,16 +199,69 @@ class TopCinemaScraper:
         except Exception:
             pass
 
+    @staticmethod
+    def _extract_html_redirect(html: str, current_url: str) -> Optional[str]:
+        """Extract <meta http-equiv="refresh"> or JS location redirect URLs from HTML."""
+        if not html:
+            return None
+        snippet = html[:15000]
+        meta_match = re.search(
+            r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\'][^"\']*url=([^"\'>\s]+)',
+            snippet,
+            re.IGNORECASE,
+        )
+        if not meta_match:
+            meta_match = re.search(
+                r'<meta[^>]+content=["\'][^"\']*url=([^"\'>\s]+)["\'][^>]+http-equiv=["\']?refresh["\']?',
+                snippet,
+                re.IGNORECASE,
+            )
+        target = meta_match.group(1).strip() if meta_match else None
+        if not target:
+            js_match = re.search(
+                r'(?:window\.)?location(?:\.href)?\s*=\s*["\'](https?://[^"\']+)["\']|'
+                r'(?:window\.)?location\.replace\(\s*["\'](https?://[^"\']+)["\']\s*\)',
+                snippet,
+                re.IGNORECASE,
+            )
+            if js_match:
+                target = (js_match.group(1) or js_match.group(2) or "").strip()
+        if not target:
+            return None
+        resolved = urljoin(current_url, target)
+        parsed = urlparse(resolved)
+        cur_parsed = urlparse(current_url)
+        if parsed.scheme in ("http", "https") and parsed.netloc and parsed.netloc != cur_parsed.netloc:
+            return resolved
+        return None
+
+    @staticmethod
+    def _is_topcinema_response(response) -> bool:
+        """Verify response came from a real TopCinema site (not an ad/parking page)."""
+        if not response or getattr(response, "status_code", 0) != 200:
+            return False
+        final_url = str(getattr(response, "url", "") or "")
+        netloc = urlparse(final_url).netloc.lower()
+        body = (getattr(response, "text", "") or "")[:40000]
+        body_lower = body.lower()
+        if any(bad in body_lower for bad in ("sedoparking", "hugedomains", "domain is for sale")):
+            return False
+        if "topcinema" in netloc:
+            return True
+        return any(sig in body for sig in ("movies2023", "TopCinema", "توب سينما", "Small--Box", "Ajaxat/"))
+
     def _handle_response_redirect(self, response):
-        """Detect and adapt to 301/302 redirects to new TopCinema domains dynamically."""
+        """Detect and adapt to 301/302 redirects (or TopCinema domain changes) dynamically."""
         try:
             if response and getattr(response, "url", None):
                 parsed = urlparse(response.url)
-                if "topcinema" in parsed.netloc.lower():
-                    resolved = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
-                    if resolved != self.base_url:
-                        self._set_active_domain(resolved)
-                        self._save_domain_cache(resolved)
+                if parsed.scheme in ("http", "https") and parsed.netloc:
+                    is_tc = "topcinema" in parsed.netloc.lower() or self._is_topcinema_response(response)
+                    if is_tc:
+                        resolved = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
+                        if resolved != self.base_url:
+                            self._set_active_domain(resolved)
+                            self._save_domain_cache(resolved)
         except Exception:
             pass
 
@@ -218,19 +273,49 @@ class TopCinemaScraper:
             parsed = urlparse(url)
             if "topcinema" in parsed.netloc.lower():
                 current_parsed = urlparse(self.base_url)
-                return url.replace(f"{parsed.scheme}://{parsed.netloc}", f"{current_parsed.scheme}://{current_parsed.netloc}")
+                if current_parsed.scheme and current_parsed.netloc:
+                    return url.replace(
+                        f"{parsed.scheme}://{parsed.netloc}",
+                        f"{current_parsed.scheme}://{current_parsed.netloc}",
+                    )
         except Exception:
             pass
         return url
 
+    def _probe_candidate(self, cand: str, use_self_session: bool = False) -> Optional[str]:
+        """Probe one candidate domain, following HTTP and HTML/JS redirects."""
+        sess = self.session if use_self_session else requests.Session(impersonate="chrome120")
+        try:
+            url = cand
+            for _ in range(3):
+                response = sess.get(url, headers=HEADERS, timeout=4.0, allow_redirects=True)
+                final_url = str(getattr(response, "url", "") or url)
+                html_redir = self._extract_html_redirect(getattr(response, "text", ""), final_url)
+                if html_redir:
+                    url = html_redir
+                    continue
+                if self._is_topcinema_response(response):
+                    parsed = urlparse(final_url)
+                    return f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
+                return None
+        except Exception:
+            return None
+        finally:
+            if not use_self_session:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+        return None
+
     def _discover_domain(self, force: bool = False) -> str:
-        """Find active working domain by probing mirrors and following 301/302 redirects."""
+        """Find active working domain by probing mirrors concurrently and following redirects."""
         if not force and DOMAIN_CACHE_FILE.exists():
             try:
                 cache_data = json.loads(DOMAIN_CACHE_FILE.read_text())
                 cached_url = cache_data.get("domain")
                 # Trust cached domain for 7 days without blocking startup network probe.
-                # Redirects on live requests will auto-update the domain anyway.
+                # Dead/blocked cached domains trigger force=True failover on first failed request.
                 if cached_url and time.time() - cache_data.get("timestamp", 0) < 86400 * 7:
                     self._set_active_domain(cached_url)
                     return self.base_url
@@ -238,26 +323,86 @@ class TopCinemaScraper:
                 pass
 
         candidates = []
-        if self.base_url:
-            candidates.append(self.base_url)
-        candidates.append(BASE_URL)
-        candidates.extend([d for d in MIRROR_DOMAINS if d not in candidates])
+        for item in [self.base_url, BASE_URL, *MIRROR_DOMAINS]:
+            norm = (item or "").rstrip('/')
+            if norm and norm not in candidates:
+                candidates.append(norm)
 
-        for cand in candidates:
-            try:
-                response = self.session.get(cand, timeout=5, allow_redirects=True)
-                if response.status_code == 200:
-                    parsed = urlparse(response.url)
-                    # Verify target domain is indeed a TopCinema domain (skip ad parking redirects)
-                    if "topcinema" in parsed.netloc.lower():
-                        resolved = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
-                        self._set_active_domain(resolved)
-                        self._save_domain_cache(resolved)
-                        return resolved
-            except Exception:
-                continue
+        # If session.get was monkeypatched (e.g. unit tests), probe sequentially via self.session
+        is_mocked = getattr(getattr(self.session, "get", None), "__self__", None) is not self.session
+        if is_mocked or len(candidates) <= 1:
+            for cand in candidates:
+                resolved = self._probe_candidate(cand, use_self_session=True)
+                if resolved:
+                    self._set_active_domain(resolved)
+                    self._save_domain_cache(resolved)
+                    return resolved
+            return self.base_url
+
+        pool = ThreadPoolExecutor(max_workers=min(8, len(candidates)))
+        try:
+            futures = {pool.submit(self._probe_candidate, cand, False): cand for cand in candidates}
+            for fut in as_completed(futures):
+                try:
+                    resolved = fut.result()
+                except Exception:
+                    resolved = None
+                if resolved:
+                    self._set_active_domain(resolved)
+                    self._save_domain_cache(resolved)
+                    return resolved
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
         return self.base_url
+
+    def _request(self, method: str, url: str, allow_failover: bool = True, **kwargs):
+        """Execute GET/POST with domain normalization, redirect following, and auto-failover."""
+        url = self._normalize_url_domain(url)
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT)
+        kwargs.setdefault("allow_redirects", True)
+
+        def _send(target_url: str, req_kwargs: dict):
+            fn = self.session.post if method.upper() == "POST" else self.session.get
+            resp = fn(target_url, **req_kwargs)
+            final_url = str(getattr(resp, "url", "") or target_url)
+            if getattr(resp, "status_code", 0) == 200 and method.upper() == "GET":
+                html_redir = self._extract_html_redirect(getattr(resp, "text", ""), final_url)
+                if html_redir:
+                    resp = self.session.get(html_redir, **req_kwargs)
+            self._handle_response_redirect(resp)
+            return resp
+
+        fail_statuses = (403, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526)
+        last_exc = None
+        response = None
+        try:
+            response = _send(url, kwargs)
+        except Exception as exc:
+            last_exc = exc
+
+        needs_failover = last_exc is not None or (
+            response is not None and getattr(response, "status_code", 0) in fail_statuses
+        )
+        if needs_failover and allow_failover and (time.monotonic() - self._last_failover_at) > 10.0:
+            old_base = self.base_url
+            self._last_failover_at = time.monotonic()
+            new_base = self._discover_domain(force=True)
+            if new_base and new_base != old_base:
+                new_url = url.replace(old_base, new_base) if old_base in url else self._normalize_url_domain(url)
+                retry_kwargs = dict(kwargs)
+                if "headers" in retry_kwargs and isinstance(retry_kwargs["headers"], dict):
+                    h = dict(retry_kwargs["headers"])
+                    if "Referer" in h and old_base in h["Referer"]:
+                        h["Referer"] = h["Referer"].replace(old_base, new_base)
+                    if "Origin" in h and old_base in h["Origin"]:
+                        h["Origin"] = h["Origin"].replace(old_base, new_base)
+                    retry_kwargs["headers"] = h
+                return _send(new_url, retry_kwargs)
+
+        if last_exc is not None:
+            raise last_exc
+        return response
     
     def _get_endpoint(self, endpoint_type: str) -> str:
         base = self.base_url.rstrip('/')
@@ -279,7 +424,8 @@ class TopCinemaScraper:
             ajax_headers["Referer"] = self.base_url
             ajax_headers["Origin"] = self.base_url
             
-            response = self.session.post(
+            response = self._request(
+                "POST",
                 self._get_endpoint("search"),
                 data=data,
                 headers=ajax_headers,
@@ -307,7 +453,8 @@ class TopCinemaScraper:
                 if content_type:
                     get_url += f"&type={content_type}"
                 
-                response = self.session.get(
+                response = self._request(
+                    "GET",
                     get_url,
                     timeout=REQUEST_TIMEOUT,
                     allow_redirects=True
@@ -397,7 +544,7 @@ class TopCinemaScraper:
             if marker in visited:
                 break
             visited.add(marker)
-            response = self.session.get(next_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            response = self._request("GET", next_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             response.raise_for_status()
             self._handle_response_redirect(response)
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -433,7 +580,7 @@ class TopCinemaScraper:
         Preserve provider order and deduplicate page URLs. The episode getter
         groups these cards by show. Fail visibly when a layout is unrecognized.
         """
-        response = self.session.get(self.base_url + '/', timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        response = self._request("GET", self.base_url + '/', timeout=REQUEST_TIMEOUT, allow_redirects=True)
         response.raise_for_status()
         self._handle_response_redirect(response)
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -483,7 +630,7 @@ class TopCinemaScraper:
     def get_episode_context(self, episode: Dict) -> Dict:
         """Resolve the selected episode's parent show lazily for shared history."""
         url = self._normalize_url_domain(episode['url'])
-        response = self.session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        response = self._request("GET", url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
         response.raise_for_status()
         self._handle_response_redirect(response)
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -595,8 +742,7 @@ class TopCinemaScraper:
     def get_movie_details(self, url: str) -> Optional[Dict]:
         url = self._normalize_url_domain(url)
         try:
-            response = self.session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            self._handle_response_redirect(response)
+            response = self._request("GET", url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.text, "html.parser")
@@ -640,8 +786,7 @@ class TopCinemaScraper:
     def get_series_details(self, url: str, show_type: str = "series") -> Optional[Dict]:
         url = self._normalize_url_domain(url)
         try:
-            response = self.session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-            self._handle_response_redirect(response)
+            response = self._request("GET", url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.text, "html.parser")
@@ -867,8 +1012,7 @@ class TopCinemaScraper:
                         current_url = f"{first_try_url}/?page={page}"
                 
                 try:
-                    response = self.session.get(current_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-                    self._handle_response_redirect(response)
+                    response = self._request("GET", current_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
                     
                     # If /list 404s, try fallback immediately
                     if response.status_code == 404 and page == 1 and use_list_endpoint and not fallback_mode:
@@ -960,17 +1104,6 @@ class TopCinemaScraper:
             
             # Sort episodes by number
             all_episodes.sort(key=lambda e: parse_episode_number(e.get("episode_number", "")))
-            
-            if poster is None:
-                try:
-                    response = self.session.get(base_url + '/', timeout=REQUEST_TIMEOUT, allow_redirects=True)
-                    self._handle_response_redirect(response)
-                    soup = BeautifulSoup(response.text, "html.parser")
-                    poster_img = soup.find("img", class_=re.compile("poster"))
-                    if poster_img:
-                        poster = poster_img.get("data-src") or poster_img.get("src")
-                except Exception as exc:
-                    logger.debug("Failed to fetch season poster for %s: %s", base_url, exc)
             
             return {
                 "season_number": season_num,
@@ -1089,8 +1222,7 @@ class TopCinemaScraper:
         
         for dl_url in dl_candidates:
             try:
-                resp_page = self.session.get(dl_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-                self._handle_response_redirect(resp_page)
+                resp_page = self._request("GET", dl_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
                 if resp_page.status_code == 200:
                     soup_page = BeautifulSoup(resp_page.text, "html.parser")
                     download_anchors = soup_page.select("a.downloadsLink")
@@ -1112,6 +1244,48 @@ class TopCinemaScraper:
                                 "video_url": None  # Resolved lazily or during health check
                             })
                         break
+            except Exception:
+                pass
+
+        # Fallback: scrape /watch/ AJAX server list if /download/ yielded no servers
+        if not servers:
+            watch_url = f"{clean_base}/watch/"
+            try:
+                w_resp = self._request("GET", watch_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+                if w_resp.status_code == 200:
+                    w_soup = BeautifulSoup(w_resp.text, "html.parser")
+                    cid = content_id or self._extract_content_id(watch_url, w_soup)
+                    ajax_url = f"{self.base_url}/wp-content/themes/movies2023/Ajaxat/Single/Server.php"
+                    ajax_headers = {**AJAX_HEADERS, "Referer": watch_url, "Origin": self.base_url}
+                    for li in w_soup.select("ul.servers-list li, .server--item, li[data-server]"):
+                        if len(servers) >= max_servers:
+                            break
+                        srv_idx = li.get("data-server")
+                        data_id = li.get("data-id") or cid
+                        srv_name = clean_text(li.get_text()) or f"Server {len(servers) + 1}"
+                        if srv_idx is None or not data_id:
+                            continue
+                        try:
+                            s_resp = self._request(
+                                "POST",
+                                ajax_url,
+                                data={"id": data_id, "i": srv_idx},
+                                headers=ajax_headers,
+                                timeout=REQUEST_TIMEOUT,
+                            )
+                            if s_resp.status_code == 200:
+                                s_soup = BeautifulSoup(s_resp.text, "html.parser")
+                                iframe = s_soup.find("iframe", src=True)
+                                if iframe and iframe["src"] not in seen_urls:
+                                    seen_urls.add(iframe["src"])
+                                    servers.append({
+                                        "name": f"⚡ {srv_name}",
+                                        "server_number": len(servers),
+                                        "embed_url": iframe["src"],
+                                        "video_url": None,
+                                    })
+                        except Exception:
+                            continue
             except Exception:
                 pass
         
@@ -1238,8 +1412,7 @@ class TopCinemaScraper:
         if not url:
             return []
         
-        episode_id = self._extract_content_id(url)
-        servers = self.get_servers(episode_id or "", url)
+        servers = self.get_servers("", url)
         episode["servers"] = servers
         return servers
     

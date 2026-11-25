@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cenima-cli"
-version = "0.2"
+dynamic = ["version"]
 description = "A cinematic terminal app to browse and stream movies and series with mpv."
 readme = "README.md"
 license = "GPL-3.0-only"
@@ -60,6 +60,9 @@ include = ["cenima*"]
 
 [tool.setuptools.package-data]
 cenima = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
 
 [tool.black]
 line-length = 100

@@ -28,13 +28,14 @@ OFFLINE = "offline"
 DEAD_HOST_MARKERS = (
     "bowfile", "1cloudfile", "nitroflare", "1fichier",
     "rapidgator", "ddownload", "mdiaload", "cloudfile",
-    "salabox", "linkbox",
+    "salabox", "linkbox", "koramaup", "turbobit", "katfile",
+    "uploadrar", "usersdrive", "megaup", "hexupload",
 )
 
 PLAYABLE_STATUS = (200, 206)
 GONE_STATUS = (404, 410)
-DEFAULT_TIMEOUT = 6.0
-PREFLIGHT_TIMEOUT = 4.0
+DEFAULT_TIMEOUT = 3.0
+PREFLIGHT_TIMEOUT = 2.5
 DEFAULT_TTL = 300.0  # seconds a cached verdict stays valid
 
 _RANK = {LIVE: 0, SLOW: 1, OFFLINE: 2}
@@ -114,7 +115,11 @@ class ServerHealthChecker:
     def _verify_stream(self, stream: str, embed_url: str,
                        proc: ServerProcessor) -> str:
         """Ask the CDN for the first bytes of the stream and grade the answer."""
-        headers = {"User-Agent": proc.headers.get("User-Agent", ""), "Referer": embed_url}
+        headers = {
+            "User-Agent": proc.headers.get("User-Agent", ""),
+            "Referer": embed_url,
+            "Range": "bytes=0-0",
+        }
         headers.update(getattr(stream, "headers", {}) or {})
         if getattr(stream, "referer", None):
             headers["Referer"] = stream.referer
@@ -149,13 +154,8 @@ class ServerHealthChecker:
             return OFFLINE, None
 
         proc = self._processor()
-        # Embed links often 301/302 to the canonical host; extract from there.
-        target = self._reachable(url, proc)
-        if not target:
-            return OFFLINE, None
-
         try:
-            stream = proc.extract(target, referer=self.referer)
+            stream = proc.extract(url, referer=self.referer)
         except Exception:
             return OFFLINE, None
         if not stream or not str(stream).startswith("http"):

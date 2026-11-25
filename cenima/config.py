@@ -1,7 +1,21 @@
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 
+
+def _read_version() -> str:
+    version_file = Path(__file__).resolve().parent.parent / "VERSION"
+    if version_file.is_file():
+        text = version_file.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    try:
+        return _pkg_version("cenima-cli")
+    except PackageNotFoundError:
+        return "0.2.1"
+
+
 # --- Version & Metadata ---
-__version__ = "0.2"
+__version__ = _read_version()
 __author__ = "np4abdou1"
 __license__ = "GPL-3.0"
 
@@ -15,13 +29,20 @@ COMPLETED_THRESHOLD = 0.85
 BASE_URL = "https://topcinema.film"
 
 MIRROR_DOMAINS = [
+    "https://topcinemaa.tv",
     "https://topcinema.film",
+    "https://topcinema.tv",
     "https://topcinema.cam",
     "https://topcinemaa.top",
+    "https://topcinema.top",
     "https://topcinema.red",
     "https://topcinemaa.co",
     "https://topcinemaa.cc",
+    "https://topcinema.cc",
+    "https://topcinema.co",
     "https://topcinema.media",
+    "https://topcinemaa.com",
+    "https://topcinema.org",
 ]
 DOMAIN_CACHE_FILE = CONFIG_DIR / "domain_cache.json"
 

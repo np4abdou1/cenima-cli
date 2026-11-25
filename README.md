@@ -35,7 +35,33 @@ Collaborator: [Abdelilah Elgallati](https://github.com/AbdelilahElgallati)
 
 ## Installation
 
-### Windows
+### Quick Install Script
+
+**Linux / macOS:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/np4abdou1/cenima-cli/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/np4abdou1/cenima-cli/main/install.ps1 | iex
+```
+
+Or from a cloned repository:
+
+```sh
+git clone https://github.com/np4abdou1/cenima-cli.git
+cd cenima-cli
+./install.sh
+```
+
+The installer creates an isolated virtual environment, installs `cenima-cli` with download support, links `cinema-cli` / `cenima-cli` / `cenima`, and checks for native tools (`mpv`, `fzf`, `ffmpeg`).
+
+### Manual Setup
+
+#### Windows
 
 Install Python and mpv, then run:
 

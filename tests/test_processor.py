@@ -75,3 +75,19 @@ def test_handle_vidtube_pro_prefers_highest_quality():
     assert isinstance(res, StreamURL)
     assert str(res) == "https://cdn.example/1080.mp4"
     assert session.requested == ["https://down.vidtube.one/d/abc12345_x"]
+
+
+def test_updown_fast_path_extracts_from_embed():
+    html = (
+        "<script>eval(function(p,a,c,k,e,d){return p}"
+        "('0:\"1://2.3/4.5\"',6,6,'file|https|gamescdn|online|video|mp4'.split('|')))</script>"
+    )
+    session = Mock()
+    session.get.return_value = SimpleNamespace(text=html, status_code=200)
+    proc = ServerProcessor(session=session)
+    res = proc.extract("https://updown.cam/61mzbhi7if19", referer="https://topcinemaa.tv/")
+    assert isinstance(res, StreamURL)
+    assert str(res) == "https://gamescdn.online/video.mp4"
+    assert res.referer == "https://updown.cam/"
+    session.get.assert_called_once()
+    assert session.get.call_args.args[0] == "https://updown.cam/embed-61mzbhi7if19.html"

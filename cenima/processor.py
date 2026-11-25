@@ -274,6 +274,21 @@ class ServerProcessor:
                 self.last_error = f'{type(exc).__name__}: {exc}'
                 pass
 
+        # Fast path for UpDown (Server #2): try /embed-<code>.html (1 GET) before 3-step XFileSharing POST
+        if any(h in hostname for h in ['updown.cam', 'okstream']):
+            if 'embed' not in url.lower() and '/e/' not in url.lower():
+                file_code = self._extract_file_code(url)
+                if file_code:
+                    embed_url = f"https://{hostname}/embed-{file_code}.html"
+                    try:
+                        resp = self.session.get(embed_url, headers=headers, timeout=10)
+                        if resp.status_code == 200:
+                            unpacked = self._handle_vidtube_one(resp.text, referer=embed_url)
+                            if unpacked:
+                                return unpacked
+                    except Exception as exc:
+                        logger.debug("Embed fast-path failed for %s: %s", embed_url, exc)
+
         # UpDown, Mdiaload, BowFile, Ddownload, 1CloudFile, Nitroflare (XFileSharing servers)
         if any(h in hostname for h in ['updown.cam', 'mdiaload', 'bowfile', 'ddownload', '1cloudfile', 'nitroflare']):
             return self.extract_xfilesharing(url, referer=referer)

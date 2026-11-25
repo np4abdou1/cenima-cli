@@ -1671,7 +1671,7 @@ class CinemaCLI:
             return any(k in url_str for k in ['vidtube', 'cdn-video', 'serv-stream']) or 'videotube' in name_str
 
         vidtube_server = next((s for s in servers if is_vidtube_server(s)), None)
-        if vidtube_server:
+        if vidtube_server and not is_episode:
             selected_server = vidtube_server
             video_url = selected_server.get('video_url')
             srv_url = selected_server.get('embed_url') or scraper.base_url
