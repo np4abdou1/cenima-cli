@@ -192,7 +192,7 @@ Use `/doctor` or `cinema-cli --doctor` to display the environment and log locati
 
 ```sh
 python -m pip install -e ".[download,dev]"
-python -m unittest discover -s tests -q
+python -m pytest -q
 python -m build
 python -m twine check dist/*
 ```

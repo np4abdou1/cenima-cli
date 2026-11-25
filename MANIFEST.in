@@ -1,2 +1,3 @@
 recursive-include tests *.py *.html
 include VERSION requirements.txt main.py
+include tools/windows_terminal_smoke.py

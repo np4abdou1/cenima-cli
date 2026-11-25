@@ -12,7 +12,6 @@ import textwrap
 import time
 import platform
 import urllib.request
-from contextlib import nullcontext
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import List, Any, Optional, Dict
@@ -21,6 +20,7 @@ from rich.text import Text
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 from rich.table import Table
 from rich.markup import escape
+from rich.cells import cell_len, set_cell_size
 
 from .scraper import TopCinemaScraper, clean_show_title
 from .history import HistoryManager
@@ -185,7 +185,8 @@ class Config:
                 self.download_dir = data.get("download_dir") or self.download_dir
                 self.download_quality = data.get("download_quality") or "best"
                 self.download_speed = data.get("download_speed") or "unlimited"
-                self.subtitle_language = data.get("subtitle_language") or "ar"
+                language = data.get("subtitle_language", "ar")
+                self.subtitle_language = language if isinstance(language, str) else "ar"
                 self.notifications = bool(data.get("notifications", False))
                 self.user_name = str(data.get("user_name", "")).strip()
                 self.welcome_theme = data.get("welcome_theme", "midnight")
@@ -300,15 +301,14 @@ class CinemaCLI:
     def log(self, emoji: str, message: str, style: str = "dim"):
         CONSOLE.print(f"[{style}]{emoji} {message}[/{style}]")
 
-    def banner(self):
-        CONSOLE.clear()
+    def _banner_renderable(self, available_height):
         theme = self.theme
 
         grid = Table.grid(padding=(0, 2))
         grid.add_column()
         grid.add_column(justify="left", vertical="middle")
 
-        art = Text(ASCII_ART, style=theme["primary"])
+        art = Text(ASCII_ART.strip('\n'), style=theme["primary"], no_wrap=True)
 
         info_text = Text()
         fzf_ready = bool(shutil.which("fzf"))
@@ -373,8 +373,28 @@ class CinemaCLI:
         info_text.append("    /theme      /doctor      /help       exit (Esc)", style="dim")
 
         grid.add_row(art, info_text)
-        CONSOLE.print(grid)
-        CONSOLE.print("")
+        if CONSOLE.width >= 110 and available_height >= 17:
+            return grid
+
+        # Use the same information without the reel when space is limited.
+        compact = [Text(f'cenima-cli v{__version__} · {engine_tag}',
+                        style=f"bold {theme['primary']}", no_wrap=True)]
+        if available_height >= 3:
+            compact.append(Text(f'{watched_movies} movies · {watched_eps} episodes · {hours} hours watched',
+                                style='dim', no_wrap=True))
+        commands = ['/continue', '/history', '/last-eps', '/last-mv', '/downloads',
+                    '/library', '/watch-later', '/settings', '/theme', '/doctor', '/help', 'exit']
+        columns = max(1, min(4, CONSOLE.width // 15))
+        command_rows = [' '.join(command.ljust(14) for command in commands[i:i + columns]).rstrip()
+                        for i in range(0, len(commands), columns)]
+        slots = max(0, available_height - len(compact))
+        compact.extend(Text(row, style='dim', no_wrap=True) for row in command_rows[:slots])
+        return Group(*compact)
+
+    def banner(self):
+        CONSOLE.clear()
+        CONSOLE.print(self._banner_renderable(max(1, CONSOLE.height - 6)))
+        CONSOLE.print('')
 
     def goodbye(self):
         CONSOLE.clear()
@@ -420,6 +440,11 @@ class CinemaCLI:
                 ]
                 if multi:
                     cmd.append("--multi")
+                if initial_index:
+                    position = max(0, min(initial_index, len(items) - 1)) + 1
+                    cmd.append(f"--bind=load:pos({position})")
+                if shortcuts:
+                    cmd.append("--expect=" + ",".join(shortcuts))
 
                 def to_plain(text_str: str) -> str:
                     try:
@@ -456,46 +481,57 @@ class CinemaCLI:
                 ansi_items = [to_ansi(str(item)) for item in items]
                 input_data = "\n".join([f"{i+1}. {item}" for i, item in enumerate(ansi_items)])
 
-                proc = subprocess.Popen(
+                with subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=None,
-                    text=True
-                )
-                out, _ = proc.communicate(input=input_data)
+                    text=True,
+                    encoding="utf-8",
+                ) as proc:
+                    try:
+                        out, _ = proc.communicate(input=input_data)
+                    except BaseException:
+                        # A failed transfer or Ctrl+C must not leave an fzf
+                        # screen competing with the fallback picker.
+                        if proc.poll() is None:
+                            proc.kill()
+                        proc.communicate()
+                        raise
 
                 if proc.returncode == 0 and out.strip():
+                    lines = out.splitlines()
+                    pressed = lines.pop(0) if shortcuts else ""
                     indices = []
-                    for selected_line in out.strip().splitlines():
+                    for selected_line in lines:
                         match = re.match(r"^(\d+)\.", selected_line)
                         if match:
                             idx = int(match.group(1)) - 1
                             if 0 <= idx < len(items):
                                 indices.append(idx)
+                    if pressed in (shortcuts or {}):
+                        action = shortcuts[pressed]
+                        if isinstance(action, int):
+                            return action
+                        index = indices[0] if indices else None
+                        return PickerAction(action, items[index] if index is not None else None, index)
                     if multi:
                         return indices
                     return indices[0] if indices else None
                 elif proc.returncode == 130:
                     return [] if multi else None
             except Exception:
-                pass
+                logger.warning("fzf failed; using the built-in picker", exc_info=True)
 
         picker = RichPicker(CONSOLE, self.theme)
-        display_title = title or ""
-        if subtitle:
-            display_title += f"\n[dim]{subtitle}[/dim]"
-        if header:
-            display_title += f"\n[bold]{header}[/bold]"
-
-        if multi:
-            idx = picker.pick(items, format_func=lambda x: str(x), title=display_title)
-            return [idx] if idx is not None else []
-
         return picker.pick(
             items,
             format_func=lambda x: str(x),
-            title=display_title
+            title=title or "",
+            subtitle=" · ".join(part for part in (subtitle, header) if part),
+            initial_index=initial_index,
+            shortcuts=shortcuts,
+            multi=multi,
         )
 
     def run_fzf_objects(
@@ -524,6 +560,9 @@ class CinemaCLI:
             shortcuts=shortcuts,
             notice=notice,
         )
+        if isinstance(idx, PickerAction):
+            item = items[idx.index] if idx.index is not None and 0 <= idx.index < len(items) else None
+            return PickerAction(idx.action, item, idx.index)
         if idx is not None and 0 <= idx < len(items):
             return items[idx]
         return None
@@ -955,6 +994,7 @@ class CinemaCLI:
             self._restore_media_context(selected)
             self.play_video(
                 selected['path'],
+                local_file=True,
                 title=selected['download_title'],
                 season_num=selected.get('season_number'),
                 ep_num=selected.get('episode_number'),
@@ -1007,6 +1047,9 @@ class CinemaCLI:
                 format_func=self._download_row,
                 title='Live downloads',
                 subtitle='Enter: actions · Esc: back',
+                shortcuts={'r': 'retry'},
+                refresh_items=self.media_store.jobs,
+                item_key=lambda job: job['id'],
             )
             if selected is None:
                 return
@@ -1015,7 +1058,9 @@ class CinemaCLI:
                 selected = selected.item
             elif isinstance(selected, int):
                 selected = jobs[selected]
-            latest = next((job for job in jobs if job['id'] == selected['id']), selected)
+            latest = next((job for job in self.media_store.jobs() if job['id'] == selected['id']), None)
+            if latest is None:
+                continue
             if shortcut:
                 self._retry_download(latest['id'])
                 continue
@@ -1067,7 +1112,20 @@ class CinemaCLI:
             else '··········'
         )
         status = {'pending': 'Queued', 'running': 'Active'}.get(job['status'], job['status'].title())
-        return f"{escape(job['download_title'])} │ {status} │ {bar} │ {escape(progress)}"
+        width = CONSOLE.width
+        title = str(job['download_title']).replace('\n', ' ').replace('\r', ' ')
+        title_width = max(8, min(40, width // 3))
+        if cell_len(title) > title_width:
+            title = set_cell_size(title, title_width - 1) + '…'
+        if width < 60:
+            amount = f'{percentage:.0f}%' if percentage is not None else '—'
+            return f"{escape(title)} │ {status} │ {amount}"
+        fixed = f"{title} │ {status} │ {bar}"
+        remaining = max(0, width - cell_len(fixed) - 3)
+        detail = progress.replace('\n', ' ').replace('\r', ' ')
+        if cell_len(detail) > remaining:
+            detail = set_cell_size(detail, remaining)
+        return escape(fixed + (' │ ' + detail if detail else ''))
 
     async def search_and_open(self, query: str):
         self.banner()
@@ -1140,16 +1198,18 @@ class CinemaCLI:
 
     async def search_flow(self):
         while True:
-            self.banner()
+            CONSOLE.clear()
             theme = self.theme
-
-            CONSOLE.print(f"[{theme['primary']}]🔍 Search [dim]• movies • series • anime[/dim][/{theme['primary']}]")
             custom_prompt = CustomPrompt(CONSOLE, theme)
 
             if not hasattr(self, 'search_history'):
                 self.search_history = []
 
-            query = custom_prompt.ask(f"[{theme['accent']}]❯[/{theme['accent']}]", history=self.search_history)
+            from .welcome import WelcomeScreen
+            query = custom_prompt.ask(
+                f"[{theme['accent']}]❯[/{theme['accent']}]", history=self.search_history,
+                render_frame=lambda prompt: WelcomeScreen(self._banner_renderable, prompt),
+            )
 
             if not query:
                 continue
@@ -1852,7 +1912,8 @@ class CinemaCLI:
         season_num: Optional[int] = None,
         ep_num: Optional[str] = None,
         ep_title: Optional[str] = None,
-        content_type: str = "movie"
+        content_type: str = "movie",
+        local_file: bool = False,
     ):
         theme = self.theme
         season = (self.current_season or {}) if ep_num is not None else {}
@@ -1893,6 +1954,7 @@ class CinemaCLI:
             start_time=start_time,
             referer=referer,
             subtitle_language=getattr(self.config, "subtitle_language", "ar"),
+            local_file=local_file,
         )
 
         if mpv_state and mpv_state.time_pos and mpv_state.time_pos > 5:
@@ -1961,7 +2023,13 @@ def main(argv=None):
             parser.error(str(exc))
         return
 
-    with CONSOLE.screen() if CONSOLE.is_terminal else nullcontext():
+    if not CONSOLE.is_terminal:
+        parser.error(
+            "Interactive mode needs terminal output. Run cinema-cli directly "
+            "in PowerShell or a terminal, without rtk proxy, pipes, or output capture."
+        )
+
+    with CONSOLE.screen():
         cli = CinemaCLI()
         cli.no_animation = bool(args.no_animation or os.environ.get('CINEMA_REDUCED_MOTION') == '1')
         try:

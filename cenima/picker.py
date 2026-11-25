@@ -1,6 +1,4 @@
 import sys
-import tty
-import termios
 import time
 import os
 import select
@@ -13,12 +11,35 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.table import Table
 from rich.markup import escape, MarkupError
+from rich.cells import cell_len
+
+
+_WINDOWS = os.name == "nt"
+if _WINDOWS:
+    import msvcrt
+else:
+    import tty
+    import termios
+
+
+_WINDOWS_KEYS = {
+    "H": "\x1b[A",  # Up
+    "P": "\x1b[B",  # Down
+    "K": "\x1b[D",  # Left
+    "M": "\x1b[C",  # Right
+    "I": "\x1b[5~",  # Page Up
+    "Q": "\x1b[6~",  # Page Down
+    "G": "\x1b[H",  # Home
+    "O": "\x1b[F",  # End
+    "S": "\x1b[3~",  # Delete
+}
 
 
 class PickerAction:
-    def __init__(self, action: str, item: Any = None):
+    def __init__(self, action: str, item: Any = None, index: Optional[int] = None):
         self.action = action
         self.item = item
+        self.index = index
 
 @contextmanager
 def raw_terminal(fd: Optional[int] = None):
@@ -28,6 +49,11 @@ def raw_terminal(fd: Optional[int] = None):
             fd = sys.stdin.fileno()
         except Exception:
             fd = 0
+    if _WINDOWS:
+        # getwch reads console input without line buffering or echo. POSIX
+        # terminal modes and select() on stdin are not available on Windows.
+        yield fd
+        return
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
@@ -37,23 +63,54 @@ def raw_terminal(fd: Optional[int] = None):
 
 def read_key(fd: int, timeout: float = 0.3) -> Optional[str]:
     """Read a single keypress or escape sequence non-blockingly."""
+    if _WINDOWS:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while not msvcrt.kbhit():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(0.01, remaining))
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            # Consume the complete extended key, including unsupported keys,
+            # so its scan code cannot become accidental prompt text.
+            return _WINDOWS_KEYS.get(msvcrt.getwch())
+        return ch
+
     r, _, _ = select.select([fd], [], [], timeout)
     if not r:
         return None
     try:
-        ch = os.read(fd, 1).decode('utf-8', errors='ignore')
+        first = os.read(fd, 1)
     except OSError:
         return None
 
-    if ch == '\x1b':
-        # Non-blocking check for escape sequences (arrow keys, fn keys, page up/down)
-        r_seq, _, _ = select.select([fd], [], [], 0.05)
-        if r_seq:
-            try:
-                ch += os.read(fd, 5).decode('utf-8', errors='ignore')
-            except OSError:
-                pass
-    return ch
+    if not first:
+        return None
+    data = first
+    if first == b'\x1b':
+        # Read exactly one escape sequence, not the following Enter/key.
+        for _ in range(10):
+            if not select.select([fd], [], [], 0.05)[0]:
+                break
+            part = os.read(fd, 1)
+            if not part:
+                break
+            data += part
+            if len(data) == 2 and part not in (b'[', b'O'):
+                break
+            if len(data) > 2 and 0x40 <= part[0] <= 0x7e:
+                break
+    else:
+        length = (2 if 0xc2 <= first[0] <= 0xdf else
+                  3 if 0xe0 <= first[0] <= 0xef else
+                  4 if 0xf0 <= first[0] <= 0xf4 else 1)
+        while len(data) < length and select.select([fd], [], [], 0.05)[0]:
+            part = os.read(fd, 1)
+            if not part:
+                break
+            data += part
+    return data.decode('utf-8', errors='replace')
 
 def safe_renderable_text(item_str: str, is_selected: bool, primary_color: str) -> Text:
     """Parse Rich markup safely, falling back to raw Text if markup is invalid or bracketed."""
@@ -72,165 +129,157 @@ def safe_renderable_text(item_str: str, is_selected: bool, primary_color: str) -
         return t
 
 class RichPicker:
-    """Lightweight left-side interactive picker with dynamic scrollbar & live filter support."""
-    
+    """A single in-place display for menus and refreshing download jobs."""
+
     def __init__(self, console: Console, theme: dict):
         self.console = console
         self.theme = theme
 
     def pick(
-        self,
-        items: List[Any],
-        format_func: Callable[[Any], str],
-        title: str = "",
-        subtitle: str = ""
-    ) -> Optional[int]:
+        self, items: List[Any], format_func: Callable[[Any], str],
+        title: str = "", subtitle: str = "", *, initial_index: int = 0,
+        shortcuts=None, multi: bool = False, refresh_items=None, item_key=None,
+    ) -> Any:
         if not items:
-            return None
-
-        selected = 0
+            return [] if multi else None
+        items = list(items)
+        selected = max(0, min(initial_index, len(items) - 1))
         offset = 0
-        filter_mode = False
-        filter_query = ""
+        filter_mode, filter_query = False, ""
+        marked = set()
+        shortcuts = shortcuts or {}
+        last_refresh = time.monotonic()
 
-        def get_filtered_indices() -> List[int]:
-            if not filter_query:
-                return list(range(len(items)))
-            q = filter_query.lower()
-            return [i for i, item in enumerate(items) if q in format_func(item).lower()]
+        def filtered():
+            query = filter_query.casefold()
+            return [i for i, item in enumerate(items)
+                    if not query or query in format_func(item).casefold()]
+
+        def render(indices, page_size):
+            table = Table.grid(expand=True)
+            table.add_column("item", no_wrap=True, overflow="ellipsis", ratio=1)
+            scrolling = len(indices) > page_size
+            if scrolling:
+                table.add_column("scrollbar", width=1)
+            if filter_mode or filter_query:
+                cells = [Text("Filter: " + filter_query + "█", style="yellow", no_wrap=True)]
+                table.add_row(*(cells + [Text("")] if scrolling else cells))
+            elif subtitle:
+                cells = [Text(subtitle.replace("\n", " "), style="dim", no_wrap=True)]
+                table.add_row(*(cells + [Text("")] if scrolling else cells))
+            if not indices:
+                cells = [Text("No matching results", style="dim italic")]
+                table.add_row(*(cells + [Text("")] if scrolling else cells))
+            else:
+                thumb_size = max(1, int(page_size * page_size / len(indices)))
+                thumb_start = int(offset / max(1, len(indices) - page_size) * (page_size - thumb_size))
+                for row, real_index in enumerate(indices[offset:offset + page_size]):
+                    label = str(format_func(items[real_index])).replace("\r", " ").replace("\n", " ")
+                    text = safe_renderable_text(label, offset + row == selected, self.theme["primary"])
+                    if multi:
+                        text = Text("☑ " if real_index in marked else "☐ ") + text
+                    cells = [text]
+                    if scrolling:
+                        cells.append(Text("█" if thumb_start <= row < thumb_start + thumb_size else "│",
+                                          style=self.theme["primary"]))
+                    table.add_row(*cells)
+            caption = title.replace("\n", " ")
+            if filter_query:
+                caption += f" ({len(indices)}/{len(items)})"
+            if multi:
+                caption += f" · {len(marked)} selected · Tab toggles"
+            return Panel(table, title=Text(caption), border_style=self.theme["accent"])
 
         try:
             fd = sys.stdin.fileno()
-        except Exception:
+        except (AttributeError, OSError, ValueError):
             fd = 0
 
-        with raw_terminal(fd):
+        # Closing a Live display on every input timeout appends a new panel.
+        # Own it for the whole menu and remove it before the next screen.
+        with raw_terminal(fd), Live(
+            console=self.console, screen=False, auto_refresh=False,
+            transient=True, vertical_overflow="crop",
+        ) as live:
             while True:
-                term_height = self.console.size.height
-                max_visible = max(4, term_height - 10)
-                
-                valid_indices = get_filtered_indices()
-                if not valid_indices:
-                    display_indices = []
-                    selected = 0
-                    offset = 0
-                else:
-                    if selected >= len(valid_indices):
-                        selected = len(valid_indices) - 1
-                    if selected < 0:
-                        selected = 0
-                    display_indices = valid_indices
+                if refresh_items and time.monotonic() - last_refresh >= 0.5:
+                    previous = filtered()
+                    identity = (item_key(items[previous[selected]])
+                                if item_key and previous and selected < len(previous) else None)
+                    items = list(refresh_items())
+                    last_refresh = time.monotonic()
+                    if not items:
+                        return [] if multi else None
+                    current = filtered()
+                    if identity is not None:
+                        selected = next((pos for pos, index in enumerate(current)
+                                         if item_key(items[index]) == identity), selected)
 
-                # Ensure cursor remains inside visible scrolling window
+                indices = filtered()
+                selected = max(0, min(selected, len(indices) - 1))
+                page_size = max(1, self.console.size.height - (5 if subtitle or filter_mode else 3))
+                offset = max(0, min(offset, max(0, len(indices) - page_size)))
                 if selected < offset:
                     offset = selected
-                elif selected >= offset + max_visible:
-                    offset = selected - max_visible + 1
-
-                def generate_renderable():
-                    table = Table.grid(expand=True)
-                    table.add_column("item")
-                    
-                    num_display = len(display_indices)
-                    if num_display > max_visible:
-                        table.add_column("scrollbar", justify="right", width=1)
-
-                    # Subtitle or Filter Line
+                elif selected >= offset + page_size:
+                    offset = selected - page_size + 1
+                live.update(render(indices, page_size), refresh=True)
+                ch = read_key(fd, timeout=0.3)
+                if ch is None:
+                    continue
+                if ch == "\x03":
+                    raise KeyboardInterrupt()
+                if ch == "\x1b":
                     if filter_mode or filter_query:
-                        filter_text = f"[bold yellow]🔍 Filter:[/] {filter_query}█"
-                        table.add_row(Text.from_markup(filter_text), "")
-                    elif subtitle:
-                        table.add_row(Text.from_markup(f"[dim]{subtitle}[/]\n"), "")
-
-                    if not display_indices:
-                        table.add_row(Text.from_markup("  [dim italic]No matching results[/]"), "")
-                    else:
-                        visible_slice = display_indices[offset : offset + max_visible]
-                        
-                        # Scrollbar Thumb Calculation
-                        visible_ratio = max_visible / num_display if num_display > 0 else 1
-                        thumb_size = max(1, int(max_visible * visible_ratio))
-                        max_offset = max(1, num_display - max_visible)
-                        scroll_ratio = offset / max_offset if num_display > max_visible else 0
-                        thumb_start = int(scroll_ratio * (max_visible - thumb_size))
-
-                        for idx, real_idx in enumerate(visible_slice):
-                            item_str = format_func(items[real_idx])
-                            is_sel = (offset + idx == selected)
-                            item_renderable = safe_renderable_text(item_str, is_sel, self.theme['primary'])
-
-                            if num_display > max_visible:
-                                is_thumb = (thumb_start <= idx < thumb_start + thumb_size)
-                                bar_char = "█" if is_thumb else "│"
-                                bar_style = self.theme['primary'] if is_thumb else "dim"
-                                bar_renderable = Text(bar_char, style=bar_style)
-                                table.add_row(item_renderable, bar_renderable)
-                            else:
-                                table.add_row(item_renderable)
-
-                    panel_title = title
-                    if filter_query:
-                        panel_title += f" [dim]({len(display_indices)}/{len(items)})[/dim]"
-
-                    return Panel(table, title=panel_title, border_style=self.theme['accent'])
-
-                with Live(generate_renderable(), console=self.console, screen=False, auto_refresh=False) as live:
-                    live.update(generate_renderable(), refresh=True)
-                    ch = read_key(fd, timeout=0.3)
-                    
-                    if ch is None:
+                        filter_mode, filter_query = False, ""
+                        selected, offset = 0, 0
                         continue
-
-                    # Global / Exit keys
-                    if ch in ('\x03', 'q', 'Q') and not filter_mode:
+                    return [] if multi else None
+                if ch in ("\r", "\n"):
+                    if indices:
+                        index = indices[selected]
+                        if multi:
+                            return sorted(marked) if marked else [index]
+                        return items[index] if refresh_items else index
+                    continue
+                if ch == "\t" and multi:
+                    if indices:
+                        index = indices[selected]
+                        marked.symmetric_difference_update({index})
+                    continue
+                if not filter_mode:
+                    if ch in shortcuts:
+                        action = shortcuts[ch]
+                        if isinstance(action, int):
+                            return action
+                        index = indices[selected] if indices else None
+                        return PickerAction(action, items[index] if index is not None else None, index)
+                    if ch in ("q", "Q"):
                         raise KeyboardInterrupt()
-                    elif ch in ('\x1b', 'b', 'B') and not filter_mode and not filter_query:
-                        return None
-                    elif ch in ('\x1b',): # ESC key clears filter
-                        if filter_mode or filter_query:
-                            filter_mode = False
-                            filter_query = ""
-                            selected = 0
-                            offset = 0
-                            continue
-                        else:
-                            return None
-                    elif ch in ('\r', '\n'): # Enter selects item
-                        if display_indices:
-                            return display_indices[selected]
+                    if ch in ("b", "B") and not filter_query:
+                        return [] if multi else None
+                    if ch == "/":
+                        filter_mode, filter_query = True, ""
+                        selected, offset = 0, 0
                         continue
-                    
-                    # Filtering toggles
-                    elif ch == '/' and not filter_mode:
-                        filter_mode = True
-                        filter_query = ""
-                        selected = 0
-                        offset = 0
-                        continue
-                    elif filter_mode:
-                        if ch in ('\x7f', '\b'): # Backspace in filter
-                            filter_query = filter_query[:-1]
-                            if not filter_query:
-                                filter_mode = False
-                        elif len(ch) == 1 and ch.isprintable():
-                            filter_query += ch
-                            selected = 0
-                            offset = 0
-                        continue
-
-                    # Navigation Keys
-                    if ch in ('\x1b[A', '\x1bOA', 'k'): # Up
-                        selected = max(0, selected - 1)
-                    elif ch in ('\x1b[B', '\x1bOB', 'j'): # Down
-                        selected = min(len(display_indices) - 1, selected + 1) if display_indices else 0
-                    elif ch in ('\x1b[5~',): # Page Up
-                        selected = max(0, selected - max_visible)
-                    elif ch in ('\x1b[6~',): # Page Down
-                        selected = min(len(display_indices) - 1, selected + max_visible) if display_indices else 0
-                    elif ch in ('\x1b[H', '\x1b[1~'): # Home
-                        selected = 0
-                    elif ch in ('\x1b[F', '\x1b[4~'): # End
-                        selected = len(display_indices) - 1 if display_indices else 0
+                if ch in ("\x1b[A", "\x1bOA") or (ch == "k" and not filter_mode):
+                    selected = max(0, selected - 1)
+                elif ch in ("\x1b[B", "\x1bOB") or (ch == "j" and not filter_mode):
+                    selected = min(len(indices) - 1, selected + 1) if indices else 0
+                elif ch == "\x1b[5~":
+                    selected = max(0, selected - page_size)
+                elif ch == "\x1b[6~":
+                    selected = min(len(indices) - 1, selected + page_size) if indices else 0
+                elif ch in ("\x1b[H", "\x1b[1~"):
+                    selected = 0
+                elif ch in ("\x1b[F", "\x1b[4~"):
+                    selected = len(indices) - 1 if indices else 0
+                elif filter_mode:
+                    if ch in ("\x7f", "\b"):
+                        filter_query = filter_query[:-1]
+                    elif len(ch) == 1 and ch.isprintable():
+                        filter_query += ch
+                    selected, offset = 0, 0
 
 
 class CustomPrompt:
@@ -240,7 +289,7 @@ class CustomPrompt:
         self.console = console
         self.theme = theme
 
-    def ask(self, prompt_text: str = "❯ ", history: List[str] = None) -> str:
+    def ask(self, prompt_text: str = "❯ ", history: List[str] = None, *, render_frame=None) -> str:
         input_str = ""
         history = history or []
         hist_idx = len(history)
@@ -252,11 +301,22 @@ class CustomPrompt:
         def render(show_cursor: bool):
             cursor = "█" if show_cursor else " "
             t = Text.from_markup(f"[{self.theme['primary']}]{prompt_text}[/] ")
-            t.append(f"{input_str}{cursor}")
-            return t
+            t.truncate(max(0, self.console.width - 1), overflow='ellipsis')
+            remaining = max(0, self.console.width - t.cell_len - 1)
+            tail, used = [], 0
+            for char in reversed(input_str):
+                size = cell_len(char)
+                if used + size > remaining:
+                    break
+                tail.append(char)
+                used += size
+            t.append(''.join(reversed(tail)) + cursor)
+            t.no_wrap = True
+            return render_frame(t) if render_frame else t
 
         with raw_terminal(fd):
-            with Live(render(True), console=self.console, screen=False, auto_refresh=False, transient=True) as live:
+            with Live(render(True), console=self.console, screen=False, auto_refresh=False,
+                      transient=True, vertical_overflow='crop') as live:
                 last_blink = time.time()
                 cursor_state = True
 
