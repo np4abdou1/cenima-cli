@@ -1198,17 +1198,17 @@ class CinemaCLI:
 
     async def search_flow(self):
         while True:
-            CONSOLE.clear()
+            self.banner()
             theme = self.theme
+            CONSOLE.print(f"[{theme['primary']}]Search [dim]• movies • series • anime[/dim][/{theme['primary']}]")
             custom_prompt = CustomPrompt(CONSOLE, theme)
 
             if not hasattr(self, 'search_history'):
                 self.search_history = []
 
-            from .welcome import WelcomeScreen
             query = custom_prompt.ask(
-                f"[{theme['accent']}]❯[/{theme['accent']}]", history=self.search_history,
-                render_frame=lambda prompt: WelcomeScreen(self._banner_renderable, prompt),
+                f"[{theme['accent']}]❯[/{theme['accent']}]",
+                history=self.search_history,
             )
 
             if not query:
