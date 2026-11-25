@@ -37,7 +37,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["build>=1.2"]
+dev = ["build>=1.2", "pytest>=7"]
 download = ["yt-dlp>=2024.10.22"]
 api = [
     "fastapi>=0.100.0",

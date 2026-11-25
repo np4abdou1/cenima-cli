@@ -448,14 +448,26 @@ def run_mpv_monitored(
     referer: Optional[str] = None,
     headers: Optional[Dict[str, str]] = None,
     subtitle_language: Optional[str] = None,
+    local_file: bool = False,
 ) -> Tuple[int, MpvState]:
     """Launch mpv with IPC monitoring enabled and return exit code and final MpvState."""
     import subprocess
     import tempfile
+    from pathlib import Path
     from .validation import validate_http_url
+    # Validation returns a plain str; retain StreamURL's request context first.
+    request_headers = dict(getattr(url, "headers", {}) or {})
+    request_headers.update(headers or {})
+    source_referer = getattr(url, "referer", None)
     try:
-        url = validate_http_url(url, allow_loopback=True)
-    except ValueError as exc:
+        if local_file:
+            path = Path(url).expanduser().resolve(strict=True)
+            if not path.is_file():
+                raise ValueError("The local media path is not a file.")
+            url = str(path)
+        else:
+            url = validate_http_url(url, allow_loopback=True)
+    except (ValueError, OSError) as exc:
         raise MpvIpcError(str(exc)) from exc
 
     ipc_name = f"cenima-mpv-{os.getpid()}-{time.time_ns()}"
@@ -476,8 +488,9 @@ def run_mpv_monitored(
         cmd.append(f"--start={int(start_time)}")
 
     # Extract or infer headers and referrer
-    req_referer = referer or getattr(url, "referer", None) or (headers.get("Referer") if headers else None)
-    req_ua = (headers.get("User-Agent") if headers else None) or getattr(url, "headers", {}).get("User-Agent")
+    lower_headers = {key.lower(): value for key, value in request_headers.items()}
+    req_referer = referer or source_referer or lower_headers.get("referer")
+    req_ua = lower_headers.get("user-agent")
 
     # Detect VidTube specifically (requires specific referer and a real browser UA to prevent 403 / TLS drops)
     is_vidtube = any(k in str(url).lower() for k in ["cdn-video", "serv-stream", "vidtube"]) or \
@@ -514,22 +527,22 @@ def run_mpv_monitored(
 
     # VidTube servers enforce TLS browser fingerprint checks; route through local StreamProxy
     proxy = None
-    if is_vidtube:
-        proxy = StreamProxy(target_url=str(url), referer=req_referer, user_agent=req_ua)
-        play_url = proxy.start()
-        cmd.append(play_url)
-    else:
-        if req_referer:
-            cmd.append(f"--referrer={req_referer}")
-        if req_ua:
-            cmd.append(f"--user-agent={req_ua}")
-        cmd.append(str(url))
-
     watcher = MpvWatcher(sock_path, poll_interval=0.5)
-    watcher.start()
-
     proc = None
     try:
+        extra_headers = any(key not in ('referer', 'user-agent') for key in lower_headers)
+        if not local_file and (is_vidtube or extra_headers):
+            proxy = StreamProxy(target_url=str(url), referer=req_referer,
+                                user_agent=req_ua, headers=request_headers)
+            play_url = proxy.start()
+        else:
+            if not local_file and req_referer:
+                cmd.append(f"--referrer={req_referer}")
+            if not local_file and req_ua:
+                cmd.append(f"--user-agent={req_ua}")
+            play_url = str(url)
+        cmd.extend(['--', play_url])
+        watcher.start()
         proc = subprocess.Popen(cmd)
         rc = proc.wait()
         from .diagnostics import log_event
@@ -550,7 +563,8 @@ def run_mpv_monitored(
                 proc.kill()
                 proc.wait()
         watcher.stop()
-        watcher.join(timeout=3.0)
+        if watcher.ident is not None:
+            watcher.join(timeout=3.0)
         if proxy:
             proxy.stop()
         if os.name != "nt" and os.path.exists(sock_path):

@@ -3,11 +3,29 @@ import shutil
 import subprocess
 import time
 import unittest
-from cenima.mpv import MpvIpcClient, MpvWatcher
+from cenima.mpv import MpvIpcClient, MpvWatcher, run_mpv_monitored
 
 
 @unittest.skipUnless(os.name == "nt" and shutil.which("mpv"), "Requires Windows mpv")
 class WindowsMpvTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'Requires ffmpeg')
+    def test_generated_local_video_plays_headlessly(self):
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'local café.mp4'
+            subprocess.run(
+                ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+                 '-i', 'color=c=black:s=64x64:r=5', '-t', '0.4', '-an',
+                 '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(path)],
+                check=True, capture_output=True, timeout=15,
+            )
+            result, _ = run_mpv_monitored(
+                str(path), local_file=True,
+                extra_args=['--no-config', '--vo=null', '--ao=null', '--really-quiet'],
+            )
+            self.assertEqual(result, 0)
+
     def test_real_named_pipe_commands_watcher_and_shutdown(self):
         path = "\\\\.\\pipe\\cenima-test-" + str(time.time_ns())
         proc = subprocess.Popen(
