@@ -60,27 +60,26 @@ def test_select_and_play_prompts_for_server_on_episode():
     from cenima.cli import CinemaCLI, PlaybackOutcome
     from cenima.health import LIVE
 
-    cli = CinemaCLI()
-    servers = [
-        {"name": "⚡ VideoTube (1080p)", "embed_url": "https://down.vidtube.one/d/abc12345.html"},
-        {"name": "⚡ UpDown (1080p)", "embed_url": "https://updown.cam/61mzbhi7if19"},
-    ]
-
-    def fake_probe_all(items, *args, **kwargs):
-        return [
-            {**items[0], "health": LIVE, "video_url": "https://cdn.example/1.mp4"},
-            {**items[1], "health": LIVE, "video_url": "https://gamescdn.online/2.mp4"},
+    with patch("cenima.cli.CinemaCLI.check_deps", return_value=None), patch("cenima.cli.ServerHealthChecker") as checker_cls:
+        cli = CinemaCLI()
+        servers = [
+            {"name": "⚡ VideoTube (1080p)", "embed_url": "https://down.vidtube.one/d/abc12345.html"},
+            {"name": "⚡ UpDown (1080p)", "embed_url": "https://updown.cam/61mzbhi7if19"},
         ]
 
-    cli.run_fzf_objects = Mock(return_value={
-        "name": "⚡ UpDown (1080p)",
-        "embed_url": "https://updown.cam/61mzbhi7if19",
-        "health": LIVE,
-        "video_url": "https://gamescdn.online/2.mp4",
-    })
-    cli.play_video = Mock(return_value=PlaybackOutcome.FINISHED)
+        def fake_probe_all(items, *args, **kwargs):
+            return [
+                {**items[0], "health": LIVE, "video_url": "https://cdn.example/1.mp4"},
+                {**items[1], "health": LIVE, "video_url": "https://gamescdn.online/2.mp4"},
+            ]
 
-    with patch("cenima.cli.ServerHealthChecker") as checker_cls:
+        cli.run_fzf_objects = Mock(return_value={
+            "name": "⚡ UpDown (1080p)",
+            "embed_url": "https://updown.cam/61mzbhi7if19",
+            "health": LIVE,
+            "video_url": "https://gamescdn.online/2.mp4",
+        })
+        cli.play_video = Mock(return_value=PlaybackOutcome.FINISHED)
         checker_cls.return_value.probe_all.side_effect = fake_probe_all
         outcome = asyncio.run(
             cli.select_and_play(servers, "Test Show · Episode 1", is_episode=True, season_num=1, ep_num="1")
