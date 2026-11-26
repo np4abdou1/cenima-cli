@@ -76,6 +76,31 @@ class PickerLifecycleTests(unittest.TestCase):
         with patch('cenima.picker.time', clock):
             self.assertIsNone(self.menu.pick(['one'], str, refresh_items=lambda: []))
 
+    def test_column_header_reserves_a_line_in_short_terminal(self):
+        frames = []
+        real_live = picker.Live
+
+        def capture(*args, **kwargs):
+            display = real_live(*args, **kwargs)
+            update = display.update
+
+            def record(renderable, **options):
+                lines = self.console.render_lines(renderable, self.console.options)
+                frames.append(len(lines))
+                return update(renderable, **options)
+
+            display.update = record
+            return display
+
+        with patch('cenima.picker.Live', side_effect=capture), patch(
+            'cenima.picker.read_key', side_effect=[None, '\x1b']
+        ):
+            self.menu.pick(list(range(50)), str, title='Downloads',
+                           subtitle='Esc: back', header=lambda: 'Title  Status  Progress')
+        self.assertTrue(frames)
+        self.assertTrue(all(height <= self.console.height for height in frames))
+        self.assertIn('Title  Status  Progress', self.console.file.getvalue())
+
 
 class PosixKeyDecodingTests(unittest.TestCase):
     def test_unicode_and_arrow_do_not_consume_the_next_key(self):

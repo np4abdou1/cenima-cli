@@ -240,7 +240,10 @@ async def _download_stream(url, directory, title, catalog_url, on_progress=None,
                     *([] if speed_bytes is None else ["--limit-rate", speed_bytes]),
                     "--continue", "--no-overwrites", "--no-colors", "--newline", "--encoding", "utf-8",
                     "--socket-timeout", "15", "--retries", "3", "--fragment-retries", "3",
-                    "--abort-on-unavailable-fragments", "--concurrent-fragments", "1",
+                    # Native fragment workers each have their own rate limiter.
+                    # Keep limited jobs serial so the saved cap stays aggregate.
+                    "--abort-on-unavailable-fragments", "--concurrent-fragments",
+                    "4" if speed_bytes is None else "1",
                     "--downloader", "dash,m3u8:native",
                     "--paths", "home:" + str(directory),
                     "--paths", "temp:" + str(partial_dir), "--output", template,

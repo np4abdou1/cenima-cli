@@ -166,7 +166,7 @@ def main():
         'fzf_initial': [('Second', '\r'), ('MENU_RESULT=1', '')],
         'fzf_retry': [('Second', 'r'), ('MENU_RESULT=1', '')],
         'multi': [('Second', '\t\x1b[B\t\r'), ('MENU_RESULT=[0, 1]', '')],
-        'downloads': [('10%', None), ('75%', '\x1b'), ('DOWNLOADS_EXITED', '')],
+        'downloads': [('10.0%', None), ('75.0%', '\x1b'), ('DOWNLOADS_EXITED', '')],
         'flow': [('Search', 'hija\r'), ('Hijack', '\x1b'), ('Search', 'exit\r')],
         'welcome': [('Search', 'x' * 45), ('xxxxx', '\x1b'), ('Search', 'exit\r'), ('FLOW_EXITED', '')],
     }

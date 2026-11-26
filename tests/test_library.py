@@ -56,6 +56,32 @@ class StoreTests(unittest.TestCase):
 
 
 class WorkerTests(StoreTests):
+    def test_worker_preserves_saved_quality_and_rate_with_legacy_defaults(self):
+        for index, preferences in enumerate(({}, {'quality': '720p', 'speed': '2MB/s'})):
+            with self.subTest(preferences=preferences):
+                identity = self.store.enqueue({**self.metadata, **preferences,
+                    'catalog_url': f'https://catalog.test/preferences/{index}',
+                    'download_title': f'Preferences {index}'}, self.root)
+                received = []
+
+                async def transfer(scraper, item, directory, title, progress):
+                    received.append(dict(item))
+                    path = Path(directory) / (title + '.mp4')
+                    path.write_bytes(b'fixture')
+                    return DownloadResult(path)
+
+                with patch('cenima.worker.download_catalog_item', side_effect=transfer):
+                    worker = DownloadWorker(self.store, lambda: object())
+                    try:
+                        worker.start()
+                        self.wait_for(lambda: next(j for j in self.store.jobs()
+                                      if j['id'] == identity)['status'] == 'completed')
+                    finally:
+                        worker.shutdown()
+                self.assertEqual(len(received), 1)
+                self.assertEqual(received[0]['quality'], preferences.get('quality', 'best'))
+                self.assertEqual(received[0]['speed'], preferences.get('speed', 'unlimited'))
+
     def wait_for(self, predicate):
         deadline = time.monotonic() + 8
         while not predicate():

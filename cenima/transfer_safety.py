@@ -56,13 +56,9 @@ def probe_source(local_url):
         try:
             response = urlopen(Request(local_url, method='HEAD'), timeout=20)
         except HTTPError as exc:
-            if exc.code not in (403, 405, 501):
-                if exc.code == 404:
-                    response = urlopen(Request(local_url, headers={'Range': 'bytes=0-0'}), timeout=20)
-                else:
-                    raise
-            else:
-                response = urlopen(Request(local_url, headers={'Range': 'bytes=0-0'}), timeout=20)
+            exc.close()
+            if exc.code not in (403, 404, 405, 501):
+                raise
             response = urlopen(Request(local_url, headers={'Range': 'bytes=0-0'}), timeout=20)
         with response:
             headers = response.headers

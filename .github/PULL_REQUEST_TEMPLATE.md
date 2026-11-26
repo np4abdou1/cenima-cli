@@ -11,7 +11,7 @@ Describe the purpose of this pull request.
 
 ## Validation
 
-- [ ] `python -m unittest discover -s tests -q`
+- [ ] `python -m pytest -q`
 - [ ] `python -m build`
 - [ ] `python -m twine check dist/*`
 - [ ] Console launcher smoke checks
