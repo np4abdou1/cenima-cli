@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -90,12 +91,29 @@ class DownloadIntegrationTests(unittest.IsolatedAsyncioTestCase):
         args = ['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=160x90:r=10',
                 '-t', '2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p']
         subprocess.run(args + [str(cls.root / 'clip.mp4')], check=True, capture_output=True)
-        subprocess.run(args + ['-f', 'hls', '-hls_time', '1', '-hls_list_size', '0',
+        subprocess.run(args + ['-g', '10', '-sc_threshold', '0', '-f', 'hls', '-hls_time', '1', '-hls_list_size', '0',
                               str(cls.root / 'index.m3u8')], check=True, capture_output=True)
         cls.requests = []
+        cls.fragment_lock = threading.Lock()
+        cls.fragment_active = cls.fragment_peak = 0
 
         class Handler(SimpleHTTPRequestHandler):
             def do_GET(self):
+                fragment = self.path.split('?')[0].endswith('.ts')
+                if fragment:
+                    with cls.fragment_lock:
+                        cls.fragment_active += 1
+                        cls.fragment_peak = max(cls.fragment_peak, cls.fragment_active)
+                try:
+                    if fragment:
+                        time.sleep(0.15)  # Simulate per-fragment request latency.
+                    self._serve()
+                finally:
+                    if fragment:
+                        with cls.fragment_lock:
+                            cls.fragment_active -= 1
+
+            def _serve(self):
                 cls.requests.append((self.path, dict(self.headers)))
                 if self.headers.get('X-Media-Test') != 'preserved':
                     self.send_error(403)
@@ -144,6 +162,7 @@ class DownloadIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.path.name, 'Film % Arabic فيلم.mp4')
 
     async def test_hls_produces_playable_media_and_preserves_segment_headers(self):
+        self.__class__.fragment_peak = 0
         result = await download_stream(self.stream('/index.m3u8'), self.root / 'hls',
                                        'Episode 1', 'https://catalog.test/episode/1')
         self.assertGreater(result.path.stat().st_size, 0)
@@ -152,6 +171,20 @@ class DownloadIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(probe.returncode, 0, probe.stderr)
         self.assertTrue(any(path.endswith('.ts') for path, _ in self.requests))
         self.assertTrue(all(headers.get('Referer') == 'https://catalog.test/' for _, headers in self.requests))
+        self.assertGreater(self.fragment_peak, 1, 'Unlimited HLS must overlap fragment requests')
+        self.assertLessEqual(self.fragment_peak, 4)
+
+    async def test_explicit_rate_limit_reaches_downloader_and_keeps_fragments_serial(self):
+        spawn = asyncio.create_subprocess_exec
+        with patch('cenima.download.asyncio.create_subprocess_exec', wraps=spawn) as launch:
+            result = await download_stream(self.stream('/clip.mp4'), self.root / 'limited',
+                'Limited', 'https://catalog.test/limited', quality='720p', speed='2MB/s')
+        arguments = next(call.args for call in launch.call_args_list
+                         if '--force-generic-extractor' in call.args)
+        self.assertEqual(arguments[arguments.index('--limit-rate') + 1], '2M')
+        self.assertEqual(arguments[arguments.index('--concurrent-fragments') + 1], '1')
+        self.assertEqual(arguments[arguments.index('--format-sort') + 1], 'res:720')
+        self.assertEqual(result.path.read_bytes(), (self.root / 'clip.mp4').read_bytes())
 
     async def test_upstream_failure_does_not_publish_a_final_file(self):
         out = self.root / 'failure'

@@ -2,6 +2,8 @@ import io
 import unittest
 from unittest.mock import Mock, patch
 from rich.console import Console
+from rich.text import Text
+from rich.cells import cell_len
 from cenima.cli import CinemaCLI
 from cenima.picker import PickerAction
 
@@ -70,9 +72,43 @@ class RetryUiTests(unittest.TestCase):
                    status='running', progress='75% 2MB/s ETA 01:00')
         with patch('cenima.cli.CONSOLE', Console(file=io.StringIO(), width=40)):
             row = self.cli._download_row(job)
-        self.assertIn('75%', row)
+        self.assertIn('75.0%', row)
         self.assertIn('Active', row)
         self.assertLessEqual(len(row), 40)
+
+    def test_columns_align_and_percentage_is_not_repeated(self):
+        with patch('cenima.cli.CONSOLE', Console(file=io.StringIO(), width=120)):
+            rows = [Text.from_markup(self.cli._download_row(dict(
+                self.job, download_title=title, status='running',
+                progress='13.5% 297.72KiB/s ETA 53:22'))).plain
+                for title in ('Short', 'A long episode title S01E05', 'فيلم 🎬 [red]')]
+            header = Text.from_markup(self.cli._download_row()).plain
+        offsets = [cell_len(row.partition('Active')[0]) for row in rows]
+        self.assertEqual(len(set(offsets)), 1)
+        self.assertEqual(offsets[0], cell_len(header.partition('Status')[0]))
+        for row in rows:
+            self.assertEqual(row.count('%'), 1)
+            self.assertIn('297.72KiB/s', row)
+            self.assertIn('ETA 53:22', row)
+            self.assertLessEqual(cell_len(row), 112)
+
+    def test_completed_row_keeps_one_percentage_and_no_solid_blocks(self):
+        with patch('cenima.cli.CONSOLE', Console(file=io.StringIO(), width=110)):
+            row = Text.from_markup(self.cli._download_row(dict(
+                self.job, status='completed', progress='100% · Complete'))).plain
+        self.assertEqual(row.count('%'), 1)
+        self.assertIn('Complete', row)
+        self.assertNotIn('█', row)
+
+    def test_live_view_initially_selects_active_job_after_completed_items(self):
+        self.cli._media_store.jobs.return_value = [
+            dict(self.job, id='done', status='completed'),
+            dict(self.job, id='active', status='running')]
+        with patch('cenima.cli.RichPicker') as picker:
+            picker.return_value.pick.return_value = None
+            self.cli.show_live_downloads()
+        self.assertEqual(picker.return_value.pick.call_args.kwargs['initial_index'], 1)
+        self.assertTrue(callable(picker.return_value.pick.call_args.kwargs['header']))
 
     def test_r_from_optional_diagnostics_retries_same_job(self):
         self.cli.run_fzf = Mock(side_effect=[1, PickerAction('retry', None)])

@@ -139,6 +139,7 @@ class RichPicker:
         self, items: List[Any], format_func: Callable[[Any], str],
         title: str = "", subtitle: str = "", *, initial_index: int = 0,
         shortcuts=None, multi: bool = False, refresh_items=None, item_key=None,
+        header: Optional[Callable[[], str]] = None,
     ) -> Any:
         if not items:
             return [] if multi else None
@@ -166,6 +167,11 @@ class RichPicker:
                 table.add_row(*(cells + [Text("")] if scrolling else cells))
             elif subtitle:
                 cells = [Text(subtitle.replace("\n", " "), style="dim", no_wrap=True)]
+                table.add_row(*(cells + [Text("")] if scrolling else cells))
+            if header:
+                text = safe_renderable_text(header(), False, self.theme["primary"])
+                text.stylize('bold dim')
+                cells = [text]
                 table.add_row(*(cells + [Text("")] if scrolling else cells))
             if not indices:
                 cells = [Text("No matching results", style="dim italic")]
@@ -217,7 +223,8 @@ class RichPicker:
 
                 indices = filtered()
                 selected = max(0, min(selected, len(indices) - 1))
-                page_size = max(1, self.console.size.height - (5 if subtitle or filter_mode else 3))
+                page_size = max(1, self.console.size.height -
+                                (5 if subtitle or filter_mode else 3) - bool(header))
                 offset = max(0, min(offset, max(0, len(indices) - page_size)))
                 if selected < offset:
                     offset = selected

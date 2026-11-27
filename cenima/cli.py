@@ -1046,7 +1046,12 @@ class CinemaCLI:
                 jobs,
                 format_func=self._download_row,
                 title='Live downloads',
-                subtitle='Enter: actions · Esc: back',
+                subtitle='Enter: actions · r: retry · Esc: back',
+                header=self._download_row,
+                initial_index=next((i for i, job in enumerate(jobs)
+                                    if job['status'] == 'running'),
+                                   next((i for i, job in enumerate(jobs)
+                                         if job['status'] == 'pending'), 0)),
                 shortcuts={'r': 'retry'},
                 refresh_items=self.media_store.jobs,
                 item_key=lambda job: job['id'],
@@ -1100,32 +1105,46 @@ class CinemaCLI:
                     self._retry_download(latest['id'])
 
     @staticmethod
-    def _download_row(job):
-        progress = job.get('progress', '')
+    def _download_row(job=None):
+        """Fixed cell-width columns; no job renders the matching column header."""
+        # Panel borders/padding, selection marker and optional scrollbar.
+        width = max(1, CONSOLE.width - 8)
+        title_width = max(1, min(40, width // 3))
+        show_bar = width >= 82
+        bar_width = 10 if width >= 92 else 6
+        progress_width = bar_width + 9 if show_bar else 6
+        status_width = 9
+        detail_width = max(0, width - title_width - status_width - progress_width - 6)
+        if job is None:
+            columns = [set_cell_size('Title', title_width),
+                       set_cell_size('Status', status_width),
+                       set_cell_size('Progress', progress_width)]
+            if detail_width >= 8:
+                columns.append(set_cell_size('Speed / ETA / Detail', detail_width))
+            return escape(set_cell_size('  '.join(columns), width))
+        progress = str(job.get('progress') or '')
         match = re.search(r'(\d+(?:\.\d+)?)%', progress)
         percentage = min(100, max(0, float(match[1]))) if match else None
         if job['status'] == 'completed':
             percentage = 100
-        bar = (
-            '█' * int(percentage / 10) + '░' * (10 - int(percentage / 10)) + f' {percentage:.0f}%'
-            if percentage is not None
-            else '··········'
-        )
+        amount = f'{percentage:5.1f}%' if percentage is not None else '     —'
+        if show_bar:
+            filled = int(percentage / 100 * bar_width) if percentage is not None else 0
+            amount = '[' + '#' * filled + '-' * (bar_width - filled) + '] ' + amount
         status = {'pending': 'Queued', 'running': 'Active'}.get(job['status'], job['status'].title())
-        width = CONSOLE.width
-        title = str(job['download_title']).replace('\n', ' ').replace('\r', ' ')
-        title_width = max(8, min(40, width // 3))
+        title = ''.join(ch if ch.isprintable() else ' ' for ch in str(job['download_title']))
         if cell_len(title) > title_width:
             title = set_cell_size(title, title_width - 1) + '…'
-        if width < 60:
-            amount = f'{percentage:.0f}%' if percentage is not None else '—'
-            return f"{escape(title)} │ {status} │ {amount}"
-        fixed = f"{title} │ {status} │ {bar}"
-        remaining = max(0, width - cell_len(fixed) - 3)
-        detail = progress.replace('\n', ' ').replace('\r', ' ')
-        if cell_len(detail) > remaining:
-            detail = set_cell_size(detail, remaining)
-        return escape(fixed + (' │ ' + detail if detail else ''))
+        detail = re.sub(r'^\s*\d+(?:\.\d+)?%\s*(?:[·|]\s*)?', '', progress).strip()
+        if job['status'] == 'completed':
+            detail = 'Already present' if 'Already present' in progress else 'Complete'
+        elif job['status'] == 'pending' and not detail:
+            detail = 'Waiting'
+        detail = ''.join(ch if ch.isprintable() else ' ' for ch in detail)
+        columns = [set_cell_size(title, title_width), set_cell_size(status, status_width), amount]
+        if detail_width >= 8:
+            columns.append(set_cell_size(detail, detail_width))
+        return escape(set_cell_size('  '.join(columns), width))
 
     async def search_and_open(self, query: str):
         self.banner()

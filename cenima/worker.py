@@ -73,7 +73,9 @@ class DownloadWorker:
                         # Lazy initialization stays off the input thread.
                         scraper = await asyncio.to_thread(self.scraper_factory)
                     self.active = asyncio.create_task(download_catalog_item(scraper,
-                        {'url': job['catalog_url'], 'manager': job.get('manager') or 'builtin'},
+                        {'url': job['catalog_url'], 'manager': job.get('manager') or 'builtin',
+                         'quality': job.get('quality') or 'best',
+                         'speed': job.get('speed') or 'unlimited'},
                         job['directory'], job['download_title'], update))
                     if self.stopping.is_set() or job['id'] in self.cancelled:
                         self.active.cancel()
